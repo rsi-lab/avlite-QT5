@@ -31,3 +31,36 @@ def pytest_runtest_setup(item):
 
     if "avlite.plugins.avlite_QT5" not in sys.modules:
         ensure_plugin_loaded()
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    ensure_plugin_loaded()
+    from avlite.plugins.avlite_QT5.qt_binding import configure_qt_env, import_qt
+
+    configure_qt_env(offscreen=os.environ.get("QT_QPA_PLATFORM") == "offscreen")
+    _c, _g, QtWidgets = import_qt()
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+@pytest.fixture
+def window(qapp, tmp_path, monkeypatch):
+    from avlite.c60_apps.c62_factory import load_stack_settings
+    from avlite.c60_apps.c65_setting_utils import load_setting
+    from avlite.c60_apps.c69_settings import AppSettings
+    from avlite.plugins.avlite_QT5.main_window import VisualizerQtWindow
+
+    monkeypatch.setenv("AVLITE_CONFIG_DIR", str(tmp_path))
+    load_setting(AppSettings, profile="default")
+    AppSettings.c62_load_plugins = True
+    AppSettings.c62_community_plugins = {PLUGIN_NAME: str(PLUGIN_DIR)}
+    load_stack_settings(profile="default", load_plugins=True)
+    ensure_plugin_loaded()
+
+    win = VisualizerQtWindow()
+    yield win
+    win.stack_panels.execution.stop_exec()
+    win.log_panel.shutdown()
+    win._ui_timer.stop()
+    win.win.close()
+    ensure_plugin_loaded()

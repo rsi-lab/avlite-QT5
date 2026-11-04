@@ -11,6 +11,9 @@ class PluginSettingsSchema(SettingsSchema):
     p60_dark_mode: bool = Field(default=True, description="Use dark UI theme.")
     p60_shortcut_mode: bool = Field(default=False, description="Collapse stack panels; show shortcut help.")
     p60_next_profile: str = Field(default="default", description="Profile switched to with shortcut F.")
+    p69_mouse_drag_slowdown_factor: float = Field(
+        default=0.5, description="Slowdown factor when dragging plots with the mouse."
+    )
     p60_bg_color: str = Field(default="#1e1e1e", description="Plot background color.")
     p60_fg_color: str = Field(default="#dddddd", description="Plot foreground/text color.")
     p60_ui_refresh_hz: float = Field(
@@ -37,7 +40,7 @@ class PluginSettingsSchema(SettingsSchema):
     p66_show_race_boundary: bool = Field(default=True, description="Show race/track boundary.")
     p66_xy_zoom: float = Field(default=30.0, description="Local XY zoom (half-width, m).")
     p66_frenet_zoom: float = Field(default=30.0, description="Frenet zoom (half-width, m).")
-    p66_global_zoom: float = Field(default=80.0, description="Global plot zoom (half-width, m).")
+    p66_global_zoom: float = Field(default=30.0, description="Global plot zoom (half-width, m).")
 
     p67_show_local_global_view: bool = Field(default=True, description="Show local XY sub-view.")
     p67_show_local_frenet_view: bool = Field(default=True, description="Show local Frenet sub-view.")
@@ -51,9 +54,12 @@ class PluginSettingsSchema(SettingsSchema):
     p68_show_plan_logs: bool = Field(default=True, description="Show planning logs.")
     p68_show_control_logs: bool = Field(default=True, description="Show control logs.")
     p68_show_execute_logs: bool = Field(default=True, description="Show execution logs.")
+    p68_show_vis_logs: bool = Field(default=True, description="Show visualization logs.")
+    p68_show_common_logs: bool = Field(default=True, description="Show common module logs.")
     p68_show_plugins_logs: bool = Field(default=True, description="Show plugin logs.")
     p68_disable_log: bool = Field(default=False, description="Disable log panel updates.")
     p68_max_log_lines: int = Field(default=1000, description="Max log lines retained.")
+    p68_log_view_expanded: bool = Field(default=False, description="Use the taller log panel.")
     p68_log_pull_time: int = Field(default=50, description="Log refresh interval (ms).")
 
 

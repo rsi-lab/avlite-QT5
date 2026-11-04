@@ -1,4 +1,4 @@
-"""AppStrategy entry point: ``avlite qt5``."""
+"""AppStrategy registered as ``avlite qt5``. Importing this module does not load Qt."""
 
 from __future__ import annotations
 

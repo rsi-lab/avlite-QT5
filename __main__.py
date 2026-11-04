@@ -1,7 +1,8 @@
 """Entry point: ``python -m avlite.plugins.avlite_QT5``.
 
-Uses stock AVLite community-plugin discovery (``CommunityPluginFinder``) and
-does not modify the AVLite core package.
+``avlite qt5`` is the normal launch once AVLite imports profile-listed
+community plugins before it parses subcommands. This module stays free of
+Qt imports so that scan can run during startup.
 """
 
 from __future__ import annotations

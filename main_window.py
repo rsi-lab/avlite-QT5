@@ -17,7 +17,6 @@ from avlite.c60_apps.c68_paths import ConfigPaths
 from avlite.c60_apps.c69_settings import AppSettings
 
 from .setting_model import VisualizationSettings
-from .shortcuts import SHORTCUTS
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ class VisualizerQtWindow:
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         self.win = QtWidgets.QMainWindow()
         self.win.setWindowTitle(f"AVLite Qt Visualizer v{__version__}")
-        self.win.resize(1400, 900)
+        self.win.resize(1400, 1000)
         self.exec = None
         self.setting = VisualizationSettings()
         self.loaded_profile: Optional[str] = None
@@ -70,12 +69,11 @@ class VisualizerQtWindow:
         self.plots_splitter.setStretchFactor(1, 1)
         root_layout.addWidget(self.plots_splitter, 1)
 
-        self.shortcut_help = QtWidgets.QLabel()
-        self.shortcut_help.setWordWrap(True)
-        self.shortcut_help.setVisible(False)
-        self.shortcut_help.setText(
-            "  |  ".join(f"{s.default}: {s.label}" for s in SHORTCUTS)
-        )
+        from .config_bar import ConfigBar
+
+        self.config_bar = ConfigBar(self)
+        self.shortcut_help = self.config_bar.shortcut_frame
+        root_layout.addWidget(self.config_bar)
         root_layout.addWidget(self.shortcut_help)
 
         from .stack_panels import StackPanels
@@ -90,7 +88,9 @@ class VisualizerQtWindow:
 
         self._build_menu()
         self.win.closeEvent = self._on_close  # type: ignore[method-assign]
-        self.win.keyPressEvent = self._on_key  # type: ignore[method-assign]
+        self.win.keyPressEvent = self._key_press_event  # type: ignore[method-assign]
+        self.win.keyReleaseEvent = self._key_release_event  # type: ignore[method-assign]
+        self._install_key_filter()
 
         self._ui_timer = QtCore.QTimer(self.win)
         self._ui_timer.timeout.connect(self.update_ui)
@@ -106,13 +106,17 @@ class VisualizerQtWindow:
         self.reload_stack(reload_code=False)
         self._apply_theme()
         self.update_views()
+        self.log_panel._flush()
+        self.log_panel._apply_level(str(self.setting.log_level.get() or "INFO"))
 
     def _build_menu(self) -> None:
         QtWidgets = self.QtWidgets
         menubar = self.win.menuBar()
         file_menu = menubar.addMenu("&File")
-        act_settings = file_menu.addAction("Settings / Profiles…")
-        act_settings.triggered.connect(self._open_profile_dialog)
+        act_settings = file_menu.addAction("Settings")
+        act_settings.triggered.connect(self.config_bar.open_settings)
+        act_plugins = file_menu.addAction("Community Plugins")
+        act_plugins.triggered.connect(self.config_bar.open_plugins)
         file_menu.addSeparator()
         act_quit = file_menu.addAction("Exit")
         act_quit.triggered.connect(self.win.close)
@@ -138,6 +142,8 @@ class VisualizerQtWindow:
         act_dark.triggered.connect(self._toggle_dark)
 
         help_menu = menubar.addMenu("&Help")
+        act_update = help_menu.addAction("Update…")
+        act_update.triggered.connect(self._on_check_update)
         act_about = help_menu.addAction("About AVLite")
         act_about.triggered.connect(self._show_about)
 
@@ -192,97 +198,202 @@ class VisualizerQtWindow:
 
     def _on_close(self, event) -> None:
         try:
+            if getattr(self, "_keys", None) is not None:
+                self.app.removeEventFilter(self._keys)
             self.stack_panels.execution.stop_exec()
             self.log_panel.shutdown()
             self._ui_timer.stop()
         finally:
             event.accept()
 
-    def _on_key(self, event) -> None:
+    def _install_key_filter(self) -> None:
+        """Catch shortcuts before a focused child (the log view) swallows them."""
+        owner = self
+        QtCore = self.QtCore
+
+        class _Keys(QtCore.QObject):
+            def eventFilter(self, obj, event):  # noqa: N802
+                et = event.type()
+                if et == QtCore.QEvent.KeyPress and owner._on_key(event):
+                    return True
+                if et == QtCore.QEvent.KeyRelease and owner._on_key_release(event):
+                    return True
+                return False
+
+        self._keys = _Keys(self.win)
+        self.app.installEventFilter(self._keys)
+
+    def _key_press_event(self, event) -> None:
+        if not self._on_key(event):
+            self.QtWidgets.QMainWindow.keyPressEvent(self.win, event)
+
+    def _key_release_event(self, event) -> None:
+        if not self._on_key_release(event):
+            self.QtWidgets.QMainWindow.keyReleaseEvent(self.win, event)
+
+    def _typing_focus(self) -> bool:
+        w = self.app.focusWidget()
+        return isinstance(w, (self.QtWidgets.QLineEdit, self.QtWidgets.QPlainTextEdit, self.QtWidgets.QSpinBox))
+
+    def _drive_blocked(self, key: str) -> bool:
+        from avlite.c30_control.c36_keyboard import keyboard_drive_owns
+
+        ctrl = getattr(self.exec, "controller", None) if self.exec is not None else None
+        return bool(keyboard_drive_owns(ctrl, key))
+
+    def _on_key(self, event) -> bool:
+        """Handle one key press. Letter case matches the Tk catalog (``S`` is Shift+S)."""
         key = event.key()
         text = event.text()
         mods = event.modifiers()
         Qt = self.QtCore.Qt
+        ctrl = bool(mods & Qt.ControlModifier)
+        shift = bool(mods & Qt.ShiftModifier)
 
-        def ignore_if_typing() -> bool:
-            w = self.app.focusWidget()
-            return isinstance(w, (self.QtWidgets.QLineEdit, self.QtWidgets.QPlainTextEdit, self.QtWidgets.QSpinBox))
-
-        if ignore_if_typing() and key not in (Qt.Key_Escape,):
-            return self.QtWidgets.QMainWindow.keyPressEvent(self.win, event)
-
-        if key == Qt.Key_Q:
+        if self._typing_focus() and key != Qt.Key_Escape:
+            return False
+        if key == Qt.Key_Escape:
+            self.win.setFocus()
+            return True
+        if text == "Q":
             self.win.close()
-            return
-        if text == "S" or (key == Qt.Key_S and mods & Qt.ShiftModifier):
+            return True
+        if ctrl and key == Qt.Key_S and not shift:
+            self.config_bar.save_settings()
+            return True
+        if text == "S" or (key == Qt.Key_S and shift and not ctrl):
             self.setting.p60_shortcut_mode.set(not self.setting.p60_shortcut_mode.get())
             self.update_shortcut_mode()
-            return
-        if key == Qt.Key_F:
+            return True
+        if text == "F":
             self.switch_profile()
-            return
-        if key == Qt.Key_R and not (mods & Qt.ShiftModifier):
+            return True
+        if text == "R":
             self.reload_stack(reload_code=True)
-            return
-        if key == Qt.Key_X:
-            self.stack_panels.execution.toggle_exec()
-            return
-        if key == Qt.Key_C:
-            self.stack_panels.execution.step_exec()
-            return
-        if key == Qt.Key_T:
-            self.stack_panels.execution.reset_exec()
-            return
-        if key == Qt.Key_L:
-            self.log_panel.clear()
-            return
-        if key == Qt.Key_Plus or key == Qt.Key_Equal:
-            self.setting.p66_global_zoom = max(5.0, self.setting.p66_global_zoom * 0.9)
-            self.setting.p66_xy_zoom = max(5.0, self.setting.p66_xy_zoom * 0.9)
-            return
-        if key == Qt.Key_Minus:
-            self.setting.p66_global_zoom = min(5000.0, self.setting.p66_global_zoom * 1.1)
-            self.setting.p66_xy_zoom = min(500.0, self.setting.p66_xy_zoom * 1.1)
-            return
-        if text == "w":
-            self.stack_panels.control._drive(3, 0)
-            return
-        if text == "s":
-            self.stack_panels.control._drive(-3, 0)
-            return
-        if text == "a":
-            self.stack_panels.control._drive(0, 0.7)
-            return
-        if text == "d":
-            self.stack_panels.control._drive(0, -0.7)
-            return
-        if text == "h":
-            self.stack_panels.control._step()
-            return
-        if text == "i":
-            self.stack_panels.control._align()
-            return
+            return True
         if text == "r":
             self.stack_panels.planning._local_replan()
-            return
+            return True
+        if text == "T":
+            self.config_bar.open_settings()
+            return True
+        if text == "t":
+            self.stack_panels.execution.reset_exec()
+            return True
+        if text == "E":
+            self.log_panel.toggle_height()
+            return True
+        if text == "x":
+            self.stack_panels.execution.toggle_exec()
+            return True
+        if text == "c":
+            self.stack_panels.execution.step_exec()
+            return True
+        if text == "L":
+            self.log_panel.clear()
+            return True
+        if text == "k":
+            self.log_panel.scroll_lines(-1)
+            return True
+        if text == "j":
+            self.log_panel.scroll_lines(1)
+            return True
+        if text == "g":
+            self.log_panel.scroll_top()
+            return True
+        if text == "G":
+            self.log_panel.scroll_bottom()
+            return True
+        if ctrl and key == Qt.Key_U:
+            self.log_panel.scroll_half_page(-1)
+            return True
+        if ctrl and key == Qt.Key_D:
+            self.log_panel.scroll_half_page(1)
+            return True
+        if key == Qt.Key_Up and not self._drive_blocked("up"):
+            self.log_panel.scroll_lines(-1)
+            return True
+        if key == Qt.Key_Down and not self._drive_blocked("down"):
+            self.log_panel.scroll_lines(1)
+            return True
+        if key in (Qt.Key_Plus, Qt.Key_Equal) and (text in ("+", "=") or not text):
+            if ctrl:
+                self.setting.p66_frenet_zoom = max(5.0, float(self.setting.p66_frenet_zoom) - 5.0)
+            else:
+                self.setting.p66_xy_zoom = max(5.0, float(self.setting.p66_xy_zoom) - 5.0)
+            self.update_ui()
+            return True
+        if key == Qt.Key_Minus or text == "-":
+            if ctrl:
+                self.setting.p66_frenet_zoom = min(500.0, float(self.setting.p66_frenet_zoom) + 5.0)
+            else:
+                self.setting.p66_xy_zoom = min(500.0, float(self.setting.p66_xy_zoom) + 5.0)
+            self.update_ui()
+            return True
+        if text == "w" and not self._drive_blocked("w"):
+            self.stack_panels.control._drive(3, 0)
+            return True
+        if text == "s" and not self._drive_blocked("s"):
+            self.stack_panels.control._drive(-3, 0)
+            return True
+        if text == "a" and not self._drive_blocked("a"):
+            self.stack_panels.control._drive(0, 0.7)
+            return True
+        if text == "d" and not self._drive_blocked("d"):
+            self.stack_panels.control._drive(0, -0.7)
+            return True
+        if text == "h":
+            self.stack_panels.control._step()
+            return True
+        if text == "i":
+            self.stack_panels.control._align()
+            return True
         if text == "n" and self.exec and self.exec.local_planner:
             gt = self.exec.local_planner.global_trajectory
             if hasattr(gt, "step_wp"):
                 gt.step_wp(1)
             self.update_ui()
-            return
+            return True
         if text == "b" and self.exec and self.exec.local_planner:
             gt = self.exec.local_planner.global_trajectory
             if hasattr(gt, "step_wp"):
                 gt.step_wp(-1)
             self.update_ui()
-            return
-        return self.QtWidgets.QMainWindow.keyPressEvent(self.win, event)
+            return True
+        return False
+
+    def _on_key_release(self, event) -> bool:
+        text = event.text()
+        if text in ("a", "d") and not self._typing_focus() and not self._drive_blocked(text):
+            self.stack_panels.control._drive(0, 0)
+            return True
+        return False
 
     def update_shortcut_mode(self) -> None:
         short = bool(self.setting.p60_shortcut_mode.get())
         self.shortcut_help.setVisible(short)
         self.stack_panels.setVisible(not short)
+
+    def _on_check_update(self) -> None:
+        from avlite.c60_apps.c66_app_update import AppUpdater
+
+        try:
+            latest = AppUpdater.latest()
+            newer = AppUpdater.is_newer(latest)
+        except Exception as exc:
+            log.warning("Update check failed: %s", exc)
+            self.QtWidgets.QMessageBox.warning(
+                self.win, "Update", f"Could not check for updates.\n\n{exc}",
+            )
+            return
+        if not newer:
+            self.QtWidgets.QMessageBox.information(
+                self.win, "Update", f"AVLite is up to date ({__version__}).",
+            )
+            return
+        self.QtWidgets.QMessageBox.information(
+            self.win, "Update", f"Update available: {__version__} → {latest}",
+        )
 
     def update_views(self) -> None:
         show_g = bool(self.setting.p67_global_plan_view.get())
@@ -290,6 +401,8 @@ class VisualizerQtWindow:
         self.global_plot.setVisible(show_g)
         self.local_plot.setVisible(show_l)
         self.local_plot.update_visibility()
+        if hasattr(self, "config_bar"):
+            self.config_bar.sync_from_settings()
         self.update_shortcut_mode()
 
     def local_plan_view_enabled(self) -> bool:
@@ -416,7 +529,9 @@ class VisualizerQtWindow:
         self.setting.sync_stack_from_singletons()
         ConfigPaths.set_startup_profile(profile)
         self.loaded_profile = profile
-        self.log_panel.clear()
+        self.setting.profile_list = list_profiles(AppSettings)
+        if hasattr(self, "config_bar"):
+            self.config_bar.sync_from_settings()
         log.info("Loaded settings from profile: %s", profile)
 
     def refresh_pipeline(self) -> None:

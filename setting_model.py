@@ -71,6 +71,7 @@ class VisualizationSettings:
         self.p60_shortcut_mode = Var(bool(PluginSettings.p60_shortcut_mode))
         self.p60_next_profile = Var(PluginSettings.p60_next_profile)
         self.p60_dark_mode = Var(bool(PluginSettings.p60_dark_mode))
+        self.p69_mouse_drag_slowdown_factor = float(PluginSettings.p69_mouse_drag_slowdown_factor)
         self.p60_bg_color = PluginSettings.p60_bg_color
         self.p60_fg_color = PluginSettings.p60_fg_color
         self.p60_ui_refresh_hz = float(PluginSettings.p60_ui_refresh_hz)
@@ -105,12 +106,20 @@ class VisualizationSettings:
         self.p68_show_plan_logs = Var(bool(PluginSettings.p68_show_plan_logs))
         self.p68_show_control_logs = Var(bool(PluginSettings.p68_show_control_logs))
         self.p68_show_execute_logs = Var(bool(PluginSettings.p68_show_execute_logs))
+        self.p68_show_vis_logs = Var(bool(PluginSettings.p68_show_vis_logs))
+        self.p68_show_common_logs = Var(bool(PluginSettings.p68_show_common_logs))
         self.p68_show_plugins_logs = Var(bool(PluginSettings.p68_show_plugins_logs))
         self.p68_disable_log = Var(bool(PluginSettings.p68_disable_log))
         self.p68_max_log_lines = int(PluginSettings.p68_max_log_lines)
         self.p68_log_pull_time = int(PluginSettings.p68_log_pull_time)
+        self.p68_log_view_expanded = Var(bool(PluginSettings.p68_log_view_expanded))
+        self.log_level = Var(ExecutionSettings.c40_log_level or "INFO")
+        self.log_to_file = Var(bool(ExecutionSettings.c40_log_to_file))
+        self.log_level.bind(lambda: setattr(ExecutionSettings, "c40_log_level", self.log_level.get()))
+        self.log_to_file.bind(lambda: setattr(ExecutionSettings, "c40_log_to_file", bool(self.log_to_file.get())))
 
         self.vehicle_state = Var("Ego: —")
+        self.perception_status_text = Var("Click plot")
         self.lap = Var("0")
         self.current_wp = Var("0")
         self.elapsed_real_time = Var("0.00")
@@ -264,6 +273,29 @@ class VisualizationSettings:
     def local_plan_view_enabled(self) -> bool:
         return bool(self.p67_show_local_global_view.get() or self.p67_show_local_frenet_view.get())
 
+    def push_plugin_schema(self) -> None:
+        """Copy toolbar/plot values onto the persisted plugin schema."""
+        schema = self.schema
+        schema.p60_dark_mode = bool(self.p60_dark_mode.get())
+        schema.p60_shortcut_mode = bool(self.p60_shortcut_mode.get())
+        schema.p60_next_profile = str(self.p60_next_profile.get() or "default")
+        schema.p69_mouse_drag_slowdown_factor = float(self.p69_mouse_drag_slowdown_factor)
+        schema.p66_xy_zoom = float(self.p66_xy_zoom)
+        schema.p66_frenet_zoom = float(self.p66_frenet_zoom)
+        schema.p66_global_zoom = float(self.p66_global_zoom)
+        schema.p67_global_plan_view = bool(self.p67_global_plan_view.get())
+        schema.p67_show_local_global_view = bool(self.p67_show_local_global_view.get())
+        schema.p67_show_local_frenet_view = bool(self.p67_show_local_frenet_view.get())
+        schema.p68_show_core_logs = bool(self.p68_show_core_logs.get())
+        schema.p68_show_plugins_logs = bool(self.p68_show_plugins_logs.get())
+        schema.p68_show_perceive_logs = bool(self.p68_show_perceive_logs.get())
+        schema.p68_show_plan_logs = bool(self.p68_show_plan_logs.get())
+        schema.p68_show_control_logs = bool(self.p68_show_control_logs.get())
+        schema.p68_show_execute_logs = bool(self.p68_show_execute_logs.get())
+        schema.p68_show_vis_logs = bool(self.p68_show_vis_logs.get())
+        schema.p68_show_common_logs = bool(self.p68_show_common_logs.get())
+        schema.p68_log_view_expanded = bool(self.p68_log_view_expanded.get())
+
     def sync_app_from_singleton(self) -> None:
         self.c62_load_plugins.set(bool(AppSettings.c62_load_plugins))
         self.c60_selected_profile.set(AppSettings.c60_selected_profile or "default")
@@ -287,6 +319,8 @@ class VisualizationSettings:
             self.control_dt.set(float(ExecutionSettings.c40_control_dt))
             self.replan_dt.set(float(ExecutionSettings.c40_replan_dt))
             self.perception_dt.set(float(ExecutionSettings.c40_perception_dt))
+            self.log_level.set(ExecutionSettings.c40_log_level or "INFO")
+            self.log_to_file.set(bool(ExecutionSettings.c40_log_to_file))
             self.sim_dt.set(float(ExecutionSettings.c40_sim_dt))
             self.localization_dt.set(float(ExecutionSettings.c40_localization_dt))
             self.pace_perception.set(bool(ExecutionSettings.c40_pace_perception))

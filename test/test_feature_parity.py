@@ -17,41 +17,8 @@ os.environ.setdefault("AVLITE_QT_NO_OPENGL", "1")
 from avlite.c10_perception.c19_settings import PerceptionSettings
 from avlite.c40_execution.c49_settings import ExecutionSettings
 from avlite.c60_apps.c61_app_strategy import AppStrategy
-from avlite.c60_apps.c62_factory import load_stack_settings
-from avlite.c60_apps.c65_setting_utils import load_setting
-from avlite.c60_apps.c69_settings import AppSettings
 
-from conftest import PLUGIN_DIR, PLUGIN_NAME, ensure_plugin_loaded
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    ensure_plugin_loaded()
-    from avlite.plugins.avlite_QT5.qt_binding import configure_qt_env, import_qt
-
-    configure_qt_env(offscreen=True)
-    _c, _g, QtWidgets = import_qt()
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-
-@pytest.fixture
-def window(qapp, tmp_path, monkeypatch):
-    monkeypatch.setenv("AVLITE_CONFIG_DIR", str(tmp_path))
-    load_setting(AppSettings, profile="default")
-    AppSettings.c62_load_plugins = True
-    AppSettings.c62_community_plugins = {PLUGIN_NAME: str(PLUGIN_DIR)}
-    load_stack_settings(profile="default", load_plugins=True)
-    ensure_plugin_loaded()
-
-    from avlite.plugins.avlite_QT5.main_window import VisualizerQtWindow
-
-    win = VisualizerQtWindow()
-    yield win
-    win.stack_panels.execution.stop_exec()
-    win.log_panel.shutdown()
-    win._ui_timer.stop()
-    win.win.close()
-    ensure_plugin_loaded()
+from conftest import ensure_plugin_loaded
 
 
 @pytest.mark.requires_data

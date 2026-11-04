@@ -37,6 +37,16 @@ def _safe_xy(xs, ys) -> tuple[np.ndarray, np.ndarray]:
     n = min(len(x), len(y))
     return x[:n], y[:n]
 
+
+def _agent_list(pm) -> list:
+    """Perception stores NPCs on ``agent_vehicles``. ``agents`` is not a field."""
+    if pm is None:
+        return []
+    vehicles = getattr(pm, "agent_vehicles", None)
+    if vehicles:
+        return list(vehicles)
+    return list(getattr(pm, "agents", []) or [])
+
 _WIDGETS_READY = False
 
 
@@ -65,9 +75,11 @@ def _install_widgets() -> None:
             self._center_delta = np.array([0.0, 0.0])
             self._map_bounds: Optional[tuple[float, float, float, float]] = None
             self._drag_pan = False
-            self._drag_teleport = False
-            self._last_pos = None
-            self._start_goal: list[tuple[float, float]] = []
+            self._pan_anchor: Optional[tuple[float, float]] = None
+            self._teleport_anchor: Optional[tuple[float, float]] = None
+            self._orienting = False
+            self._left_press_time = 0.0
+            self._start_point: Optional[tuple[float, float]] = None
             self._hover_plan_xy: Optional[np.ndarray] = None
             self._hover_plan_v: Optional[np.ndarray] = None
 
@@ -84,12 +96,11 @@ def _install_widgets() -> None:
             self.hover_text = pg.TextItem(color="w", anchor=(0, 1))
             self.addItem(self.hover_text)
             self.hover_text.hide()
+            self.orient_line = self.plotItem.plot(pen=pg.mkPen("#ffffff", width=1, style=QtCore.Qt.DashLine))
 
-            self.scene().sigMouseMoved.connect(self._on_mouse_moved)
-            self.scene().sigMouseClicked.connect(self._on_mouse_clicked)
-            vb = self.getViewBox()
-            vb.mouseDragEvent = self._mouse_drag_event  # type: ignore[method-assign]
-            vb.wheelEvent = self._wheel_event  # type: ignore[method-assign]
+            from .plot_input import attach_plot_mouse
+
+            attach_plot_mouse(self, self)
 
             self._last_draw_ms = 0.0
             self._fps = 0.0
@@ -99,7 +110,10 @@ def _install_widgets() -> None:
         def reset(self) -> None:
             self._map_bounds = None
             self._center_delta[:] = 0.0
-            self._start_goal.clear()
+            self._start_point = None
+            self._drag_pan = False
+            self._orienting = False
+            self.orient_line.setData([], [])
             for item in self.hdmap_lanes:
                 self.removeItem(item)
             self.hdmap_lanes.clear()
@@ -115,68 +129,171 @@ def _install_widgets() -> None:
             self.getAxis("bottom").setPen(fg)
             self.getAxis("left").setPen(fg)
 
-        def _wheel_event(self, ev):  # noqa: N802
-            delta = ev.delta() if hasattr(ev, "delta") else ev.angleDelta().y()
-            factor = 0.9 if delta > 0 else 1.1
-            self.root.setting.p66_global_zoom = float(
-                np.clip(self.root.setting.p66_global_zoom * factor, 5.0, 5000.0)
+        def _ctrl(self, modifiers) -> bool:
+            return bool(modifiers & QtCore.Qt.ControlModifier)
+
+        def _xy(self, pos) -> tuple[float, float]:
+            return float(pos.x()), float(pos.y())
+
+        def on_press(self, pos, button, modifiers) -> None:
+            if self.root.exec is None:
+                return
+            x, y = self._xy(pos)
+            self._status(f"Teleport {x:.1f},{y:.1f}")
+            if button == QtCore.Qt.LeftButton:
+                self._left_press_time = time.time()
+                if self._ctrl(modifiers):
+                    self._drag_pan = True
+                    self._pan_anchor = (x, y)
+                    self._orienting = False
+                    self.orient_line.setData([], [])
+                else:
+                    self._drag_pan = False
+                    self._teleport_anchor = (x, y)
+                    self._orienting = False
+                    self.orient_line.setData([], [])
+            elif button == QtCore.Qt.RightButton:
+                self._set_start_or_goal(x, y)
+
+        def on_move(self, pos, buttons, modifiers) -> None:
+            x, y = self._xy(pos)
+            if not buttons:
+                self._status(f"Teleport {x:.1f},{y:.1f}")
+                self._on_mouse_moved(pos)
+                return
+            if self.root.exec is None:
+                return
+            if buttons & QtCore.Qt.LeftButton:
+                # Ctrl at press, or Ctrl within 0.5s, pans. Otherwise the drag sets heading.
+                late_pan = (
+                    self._ctrl(modifiers)
+                    and (not self._orienting or time.time() - self._left_press_time < 0.5)
+                )
+                if self._drag_pan or late_pan:
+                    if self._pan_anchor is None or not self._drag_pan:
+                        self._pan_anchor = (x, y)
+                        self._drag_pan = True
+                        self._orienting = False
+                        self.orient_line.setData([], [])
+                        return
+                    factor = float(self.root.setting.p69_mouse_drag_slowdown_factor)
+                    dx = -(x - self._pan_anchor[0]) * factor
+                    dy = -(y - self._pan_anchor[1]) * factor
+                    self._center_delta[0] += dx
+                    self._center_delta[1] += dy
+                    self._pan_anchor = (x, y)
+                    self.redraw()
+                    return
+                if self._teleport_anchor is None:
+                    return
+                x0, y0 = self._teleport_anchor
+                theta = float(np.arctan2(y - y0, x - x0))
+                self._orienting = True
+                self.orient_line.setData(
+                    [x0, x0 + 4.0 * np.cos(theta)],
+                    [y0, y0 + 4.0 * np.sin(theta)],
+                )
+                self.root.teleport_ego(x=x0, y=y0, theta=theta)
+                self._step_local_planner()
+                self.root.update_ui()
+
+        def on_release(self, pos, button, modifiers) -> None:
+            if button != QtCore.Qt.LeftButton or self.root.exec is None:
+                self._drag_pan = False
+                self._pan_anchor = None
+                return
+            if not self._drag_pan and not self._orienting and self._teleport_anchor is not None:
+                x0, y0 = self._teleport_anchor
+                self.root.teleport_ego(x=x0, y=y0)
+                self._step_local_planner()
+            self._drag_pan = False
+            self._pan_anchor = None
+            self._teleport_anchor = None
+            self._orienting = False
+            self.orient_line.setData([], [])
+            if self.root.exec.controller is not None:
+                self.root.exec.controller.reset()
+            self.root.update_ui()
+
+        def on_wheel(self, pos, delta: int) -> None:
+            from .plot_input import zoom_step
+
+            zoom = zoom_step(
+                float(self.root.setting.p66_global_zoom), delta, lo=5.0, hi=5000.0,
             )
-            ev.accept()
+            bounds = self._map_bounds
+            if bounds is not None and delta < 0:
+                width = float(bounds[1] - bounds[0])
+                height = float(bounds[3] - bounds[2])
+                aspect = max(self.width() / max(self.height(), 1), 0.25)
+                cap = min(width, height * aspect)
+                if cap > 5.0:
+                    zoom = min(zoom, cap)
+            self.root.setting.p66_global_zoom = zoom
+            if self.root.exec is not None and not self.root.setting.exec_running:
+                self.redraw()
 
-        def _mouse_drag_event(self, ev, axis=None):  # noqa: N802
-            if ev.button() not in (QtCore.Qt.LeftButton, QtCore.Qt.NoButton) and ev.button() != QtCore.Qt.LeftButton:
-                return pg.ViewBox.mouseDragEvent(self.getViewBox(), ev, axis=axis)
-            pos = self.getViewBox().mapSceneToView(ev.scenePos())
-            modifiers = QtWidgets.QApplication.keyboardModifiers()
-            if ev.isStart():
-                self._last_pos = (pos.x(), pos.y())
-                self._drag_pan = bool(modifiers & QtCore.Qt.ControlModifier)
-                self._drag_teleport = not self._drag_pan
-                ev.accept()
+        def _set_start_or_goal(self, x: float, y: float) -> None:
+            if self.root.exec is None or self.root.exec.global_planner is None:
                 return
-            if ev.isFinish():
-                if self._drag_teleport and self.root.exec is not None and self._last_pos is not None:
-                    x0, y0 = self._last_pos
-                    theta = float(np.arctan2(pos.y() - y0, pos.x() - x0))
-                    self.root.teleport_ego(pos.x(), pos.y(), theta)
-                    self.root.update_ui()
-                self._drag_pan = self._drag_teleport = False
-                self._last_pos = None
-                ev.accept()
-                return
-            if self._drag_pan and self._last_pos is not None:
-                dx = pos.x() - self._last_pos[0]
-                dy = pos.y() - self._last_pos[1]
-                self._center_delta[0] -= dx
-                self._center_delta[1] -= dy
-                self._last_pos = (pos.x(), pos.y())
-            ev.accept()
-
-        def _on_mouse_clicked(self, ev):
-            if ev.button() != QtCore.Qt.RightButton or self.root.exec is None:
-                return
-            pos = self.getViewBox().mapSceneToView(ev.scenePos())
-            pt = (float(pos.x()), float(pos.y()))
-            self._start_goal.append(pt)
-            if len(self._start_goal) == 1:
-                self.start_marker.setData([pt[0]], [pt[1]])
+            if self._start_point is None:
+                self._start_point = (x, y)
+                self.start_marker.setData([x], [y])
                 self.goal_marker.setData([], [])
-            elif len(self._start_goal) >= 2:
-                start, goal = self._start_goal[0], self._start_goal[1]
-                self.start_marker.setData([start[0]], [start[1]])
-                self.goal_marker.setData([goal[0]], [goal[1]])
-                gp = self.root.exec.global_planner
-                if gp is not None and hasattr(gp, "set_start_goal"):
-                    gp.set_start_goal(start, goal)
-                    self.root.replan_global()
-                self._start_goal.clear()
+                log.info("Set start: %s", self._start_point)
+                return
+            start = self._start_point
+            goal = (x, y)
+            self.start_marker.setData([start[0]], [start[1]])
+            self.goal_marker.setData([goal[0]], [goal[1]])
+            gp = self.root.exec.global_planner
+            gp.set_start_goal(start_point=start, goal_point=goal)
+            log.info("Set start: %s, goal: %s", start, goal)
+            try:
+                plan = gp.plan(
+                    perception_model=self.root.exec.pm,
+                    sensors=self.root.exec.world.get_sensor_frame(),
+                )
+            except Exception:
+                log.exception("Global replan from right-click failed")
+                self.root.update_ui()
+                return
+            plan = plan if plan is not None else getattr(gp, "global_plan", None)
+            path = getattr(plan, "path", None)
+            if path is not None and len(path) == 0:
+                # Tk keeps the start so the next right-click tries another goal.
+                log.warning("No global plan found. Please check the start and goal points.")
+                return
+            planner_type = str(self.root.setting.global_planner_type.get() or "")
+            traj = getattr(plan, "trajectory", None) if plan is not None else None
+            path_s = getattr(traj, "path_s", None) if traj is not None else None
+            if "HDMap" in planner_type and path_s is not None and len(path_s) > 0:
+                self.root.apply_global_plan(
+                    plan, ego_xy=(self.root.exec.ego_state.x, self.root.exec.ego_state.y),
+                )
+            self._start_point = None
+            self.root.update_ui()
+
+        def _step_local_planner(self) -> None:
+            planner = getattr(self.root.exec, "local_planner", None)
+            if planner is None:
+                return
+            try:
+                planner.step(state=self.root.exec.world.get_ego_state())
+            except Exception:
+                log.debug("local planner step after teleport failed", exc_info=True)
+
+        def _status(self, text: str) -> None:
+            status = getattr(self.root.setting, "perception_status_text", None)
+            if status is not None:
+                status.set(text)
 
         def _on_mouse_moved(self, pos):
             if self._hover_plan_xy is None or len(self._hover_plan_xy) == 0:
                 self.hover_marker.setData([], [])
                 self.hover_text.hide()
                 return
-            mouse = self.getViewBox().mapSceneToView(pos)
+            mouse = pos
             xy = self._hover_plan_xy
             d2 = (xy[:, 0] - mouse.x()) ** 2 + (xy[:, 1] - mouse.y()) ** 2
             i = int(np.argmin(d2))
@@ -318,13 +435,16 @@ def _install_widgets() -> None:
 
             self._init_curves()
             self._last_draw_ms = 0.0
-            self._npc_drag = False
-            self._npc_start = None
+            self._left_anchor: Optional[tuple[float, float]] = None
+            self._right_anchor: Optional[tuple[float, float]] = None
+            self._spawn_agent = None
+            self._spawn_in_xy = True
+            self._moved = False
 
-            vb = self.xy_plot.getViewBox()
-            vb.mouseDragEvent = self._xy_drag  # type: ignore[method-assign]
-            vb.wheelEvent = self._xy_wheel  # type: ignore[method-assign]
-            self.frenet_plot.getViewBox().wheelEvent = self._frenet_wheel  # type: ignore[method-assign]
+            from .plot_input import attach_plot_mouse
+
+            attach_plot_mouse(self.xy_plot, _PaneMouse(self, frenet=False))
+            attach_plot_mouse(self.frenet_plot, _PaneMouse(self, frenet=True))
 
         def _init_curves(self) -> None:
             self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2))
@@ -357,6 +477,15 @@ def _install_widgets() -> None:
             ]
             self.sd_lidar = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(50, 255, 50, 200), pen=None)
             self.frenet_plot.addItem(self.sd_lidar)
+            ruler_pen = pg.mkPen("#00bcd4", width=1, style=QtCore.Qt.DashLine)
+            self.xy_ruler = self.xy_plot.plotItem.plot(pen=ruler_pen)
+            self.sd_ruler = self.frenet_plot.plotItem.plot(pen=ruler_pen)
+            self.xy_ruler_text = pg.TextItem(color="#00bcd4", anchor=(0, 1))
+            self.sd_ruler_text = pg.TextItem(color="#00bcd4", anchor=(0, 1))
+            self.xy_plot.addItem(self.xy_ruler_text)
+            self.frenet_plot.addItem(self.sd_ruler_text)
+            self.xy_ruler_text.hide()
+            self.sd_ruler_text.hide()
 
         def reset(self) -> None:
             for curve in (
@@ -370,6 +499,7 @@ def _install_widgets() -> None:
             self.xy_lidar.setData([], [])
             self.xy_clusters.setData([], [])
             self.sd_lidar.setData([], [])
+            self._hide_ruler()
 
         def update_theme(self, bg: str, fg: str) -> None:
             for pw in (self.xy_plot, self.frenet_plot):
@@ -382,68 +512,129 @@ def _install_widgets() -> None:
             self.xy_plot.setVisible(bool(s.p67_show_local_global_view.get()))
             self.frenet_plot.setVisible(bool(s.p67_show_local_frenet_view.get()))
 
-        def _xy_wheel(self, ev):  # noqa: N802
-            delta = ev.delta() if hasattr(ev, "delta") else ev.angleDelta().y()
-            factor = 0.9 if delta > 0 else 1.1
-            self.root.setting.p66_xy_zoom = float(
-                np.clip(self.root.setting.p66_xy_zoom * factor, 5.0, 500.0)
-            )
-            ev.accept()
+        def _status(self, text: str) -> None:
+            status = getattr(self.root.setting, "perception_status_text", None)
+            if status is not None:
+                status.set(text)
 
-        def _frenet_wheel(self, ev):  # noqa: N802
-            delta = ev.delta() if hasattr(ev, "delta") else ev.angleDelta().y()
-            factor = 0.9 if delta > 0 else 1.1
-            self.root.setting.p66_frenet_zoom = float(
-                np.clip(self.root.setting.p66_frenet_zoom * factor, 5.0, 500.0)
-            )
-            ev.accept()
+        def _step_local(self) -> None:
+            planner = getattr(self.root.exec, "local_planner", None)
+            if planner is None:
+                return
+            try:
+                planner.step(state=self.root.exec.world.get_ego_state())
+            except Exception:
+                log.debug("local planner step after teleport failed", exc_info=True)
 
-        def _xy_drag(self, ev, axis=None):  # noqa: N802
+        def handle_press(self, x: float, y: float, button, *, frenet: bool) -> None:
             if self.root.exec is None:
                 return
-            pos = self.xy_plot.getViewBox().mapSceneToView(ev.scenePos())
-            if ev.button() == QtCore.Qt.LeftButton or (
-                ev.button() == QtCore.Qt.NoButton and self._npc_drag is False and getattr(self, "_teleporting", False)
-            ):
-                if ev.button() == QtCore.Qt.LeftButton or getattr(self, "_teleporting", False):
-                    if ev.isStart():
-                        self._teleporting = True
-                        self._teleport_start = (pos.x(), pos.y())
-                        ev.accept()
-                        return
-                    if ev.isFinish() and getattr(self, "_teleporting", False):
-                        x0, y0 = self._teleport_start
-                        theta = float(np.arctan2(pos.y() - y0, pos.x() - x0))
-                        self.root.teleport_ego(pos.x(), pos.y(), theta)
-                        self.root.update_ui()
-                        self._teleporting = False
-                        ev.accept()
-                        return
-                    ev.accept()
-                    return
-            if ev.button() == QtCore.Qt.RightButton or self._npc_drag:
-                from avlite.c10_perception.c11_perception_model import AgentState
+            self._moved = False
+            if button == QtCore.Qt.LeftButton:
+                self._left_press(x, y, frenet=frenet)
+            elif button == QtCore.Qt.RightButton:
+                self._right_press(x, y, frenet=frenet)
 
-                if ev.isStart():
-                    self._npc_drag = True
-                    self._npc_start = (pos.x(), pos.y())
-                    ev.accept()
-                    return
-                if ev.isFinish() and self._npc_drag and self._npc_start is not None:
-                    x0, y0 = self._npc_start
-                    theta = float(np.arctan2(pos.y() - y0, pos.x() - x0))
-                    agent = AgentState()
-                    agent.x, agent.y, agent.theta = float(pos.x()), float(pos.y()), theta
-                    agent.velocity = float(self.root.exec.ego_state.velocity)
-                    self.root.spawn_agent(agent)
-                    self.root.update_ui()
-                    self._npc_drag = False
-                    self._npc_start = None
-                    ev.accept()
-                    return
-                ev.accept()
+        def handle_move(self, x: float, y: float, buttons, *, frenet: bool) -> None:
+            if self.root.exec is None:
                 return
-            return pg.ViewBox.mouseDragEvent(self.xy_plot.getViewBox(), ev, axis=axis)
+            if not buttons:
+                self._status(f"Spawn {x:.1f},{y:.1f}" if not frenet else f"Spawn S:{x:.1f},D:{y:.1f}")
+                self._update_ruler(x, y, frenet=frenet)
+                return
+            self._hide_ruler()
+            self._moved = True
+            if buttons & QtCore.Qt.LeftButton and self._left_anchor is not None:
+                self._left_drag(x, y, frenet=frenet)
+            elif buttons & QtCore.Qt.RightButton and self._spawn_agent is not None:
+                self._right_drag(x, y, frenet=frenet)
+
+        def handle_release(self, button) -> None:
+            if self.root.exec is None:
+                return
+            if button == QtCore.Qt.LeftButton and not self._moved and self._left_anchor is not None:
+                # A click with no drag already teleported on press (Tk). Nothing else.
+                pass
+            if button in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
+                if self.root.exec.controller is not None and button == QtCore.Qt.LeftButton:
+                    self.root.exec.controller.reset()
+                self._left_anchor = None
+                self._right_anchor = None
+                self._spawn_agent = None
+                self.root.update_ui()
+
+        def handle_wheel(self, delta: int, *, frenet: bool) -> None:
+            from .plot_input import zoom_step
+
+            if frenet:
+                self.root.setting.p66_frenet_zoom = zoom_step(
+                    float(self.root.setting.p66_frenet_zoom), delta, lo=5.0, hi=500.0,
+                )
+            else:
+                self.root.setting.p66_xy_zoom = zoom_step(
+                    float(self.root.setting.p66_xy_zoom), delta, lo=5.0, hi=500.0,
+                )
+            if self.root.exec is not None and not self.root.setting.exec_running:
+                self.root.update_ui()
+
+        def _left_press(self, x: float, y: float, *, frenet: bool) -> None:
+            if frenet:
+                traj = self.root.exec.local_planner.global_plan.trajectory
+                wx, wy = traj.convert_sd_to_xy(x, y)
+            else:
+                wx, wy = x, y
+            self._left_anchor = (wx, wy, x, y, frenet)
+            self.root.teleport_ego(wx, wy)
+            self._step_local()
+            self.root.update_ui()
+            self._status(f"Spawn {wx:.1f},{wy:.1f}")
+
+        def _left_drag(self, x: float, y: float, *, frenet: bool) -> None:
+            wx, wy, ax, ay, was_frenet = self._left_anchor
+            if was_frenet != frenet:
+                return
+            if frenet:
+                theta_sd = float(np.arctan2(y - ay, x - ax))
+                traj = self.root.exec.local_planner.global_plan.trajectory
+                _x, _y, theta = traj.convert_sd_orientation_to_xy_orientation(x, y, theta_sd)
+                self.root.teleport_ego(wx, wy, theta)
+            else:
+                theta = float(np.arctan2(y - wy, x - wx))
+                self.root.teleport_ego(wx, wy, theta)
+            self._step_local()
+            self.root.update_ui()
+
+        def _right_press(self, x: float, y: float, *, frenet: bool) -> None:
+            from avlite.c10_perception.c11_perception_model import AgentState
+
+            ego = self.root.exec.ego_state
+            if frenet:
+                traj = self.root.exec.local_planner.global_plan.trajectory
+                wx, wy = traj.convert_sd_to_xy(x, y)
+                self._status(f"Spawn S:{x:.1f},D:{y:.1f}")
+            else:
+                wx, wy = x, y
+                self._status(f"Spawn {x:.1f},{y:.1f}")
+            agent = AgentState(x=float(wx), y=float(wy), theta=float(ego.theta), velocity=0)
+            self.root.spawn_agent(agent)
+            self._spawn_agent = agent
+            self._right_anchor = (float(wx), float(wy), x, y, frenet)
+            self._spawn_in_xy = not frenet
+            self.root.update_ui()
+            log.info("Spawned agent at (%.2f, %.2f)", wx, wy)
+
+        def _right_drag(self, x: float, y: float, *, frenet: bool) -> None:
+            wx, wy, ax, ay, was_frenet = self._right_anchor
+            if was_frenet != frenet or self._spawn_agent is None:
+                return
+            if frenet:
+                theta_sd = float(np.arctan2(y - ay, x - ax))
+                traj = self.root.exec.local_planner.global_plan.trajectory
+                _x, _y, theta = traj.convert_sd_orientation_to_xy_orientation(ax, ay, theta_sd)
+            else:
+                theta = float(np.arctan2(y - wy, x - wx))
+            self._spawn_agent.theta = theta
+            self.root.update_ui()
 
         def redraw(self) -> float:
             t0 = time.perf_counter()
@@ -528,7 +719,9 @@ def _install_widgets() -> None:
                         self.sd_ego.setData(*_closed_poly(sd_c))
                     except Exception:
                         self.sd_ego.setData([], [])
-                agents = list(getattr(stack.pm, "agents", []) or [])[:12]
+                agents = _agent_list(stack.pm)[:12]
+                if not agents and getattr(stack, "world", None) is not None:
+                    agents = _agent_list(getattr(stack.world, "pm", None))[:12]
                 for i, curve in enumerate(self.xy_agents):
                     if i < len(agents):
                         curve.setData(*_closed_poly(agents[i].get_bb_corners()))
@@ -578,7 +771,7 @@ def _install_widgets() -> None:
             if s.p67_show_prediction.get() and stack.pm is not None:
                 pred_x: list[float] = []
                 pred_y: list[float] = []
-                for agent in getattr(stack.pm, "agents", []) or []:
+                for agent in _agent_list(stack.pm):
                     pred = getattr(agent, "prediction", None)
                     traj = None
                     if pred is not None:
@@ -623,6 +816,71 @@ def _install_widgets() -> None:
 
             self._last_draw_ms = (time.perf_counter() - t0) * 1000.0
             return self._last_draw_ms
+
+        def _hide_ruler(self) -> None:
+            self.xy_ruler.setData([], [])
+            self.sd_ruler.setData([], [])
+            self.xy_ruler_text.hide()
+            self.sd_ruler_text.hide()
+
+        def _update_ruler(self, x: float, y: float, *, frenet: bool) -> None:
+            """Paused distance from the ego front axle to the cursor, matching Tk."""
+            if (
+                self.root.exec is None
+                or self.root.setting.exec_running
+                or self._left_anchor is not None
+                or self._spawn_agent is not None
+            ):
+                self._hide_ruler()
+                return
+            ego = self.root.exec.ego_state
+            ctrl = self.root.exec.controller
+            front = float(getattr(ctrl, "ego_distance_front_axle", 2.5) or 2.5)
+            fx = float(ego.x) + front * float(np.cos(ego.theta))
+            fy = float(ego.y) + front * float(np.sin(ego.theta))
+            if not frenet:
+                dist = float(np.hypot(x - fx, y - fy))
+                self.xy_ruler.setData([fx, x], [fy, y])
+                self.xy_ruler_text.setText(f"{dist:.1f} m")
+                self.xy_ruler_text.setPos(x, y)
+                self.xy_ruler_text.show()
+                self.sd_ruler.setData([], [])
+                self.sd_ruler_text.hide()
+                return
+            traj = getattr(getattr(self.root.exec, "local_planner", None), "global_trajectory", None)
+            if traj is None:
+                self._hide_ruler()
+                return
+            try:
+                fs, fd = traj.convert_xy_to_sd(fx, fy)
+                cx, cy = traj.convert_sd_to_xy(x, y)
+            except Exception:
+                self._hide_ruler()
+                return
+            dist = float(np.hypot(float(cx) - fx, float(cy) - fy))
+            self.sd_ruler.setData([float(fs), x], [float(fd), y])
+            self.sd_ruler_text.setText(f"{dist:.1f} m")
+            self.sd_ruler_text.setPos(x, y)
+            self.sd_ruler_text.show()
+            self.xy_ruler.setData([], [])
+            self.xy_ruler_text.hide()
+
+    class _PaneMouse:
+        def __init__(self, plot: "LocalPlotWidget", *, frenet: bool):
+            self.plot = plot
+            self.frenet = frenet
+
+        def on_press(self, pos, button, modifiers) -> None:
+            self.plot.handle_press(float(pos.x()), float(pos.y()), button, frenet=self.frenet)
+
+        def on_move(self, pos, buttons, modifiers) -> None:
+            self.plot.handle_move(float(pos.x()), float(pos.y()), buttons, frenet=self.frenet)
+
+        def on_release(self, pos, button, modifiers) -> None:
+            self.plot.handle_release(button)
+
+        def on_wheel(self, pos, delta: int) -> None:
+            self.plot.handle_wheel(delta, frenet=self.frenet)
 
 
 def __getattr__(name: str):
