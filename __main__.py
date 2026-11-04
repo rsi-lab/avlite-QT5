@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from avlite.c60_apps.c61_app_strategy import AppStrategy
 
-    cls = AppStrategy.registry.get("qt")
+    cls = AppStrategy.registry.get("qt5")
     if cls is None:
         print("Qt visualizer AppStrategy did not register.", file=sys.stderr)
         return 1

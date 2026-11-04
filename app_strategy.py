@@ -1,4 +1,4 @@
-"""AppStrategy entry point: ``avlite qt``."""
+"""AppStrategy entry point: ``avlite qt5``."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 class VisualizationQtApp(AppStrategy):
     """High-performance Qt5 / pyqtgraph visualizer (alternative to the Tk app)."""
 
-    cli_name = "qt"
+    cli_name = "qt5"
     help = "Real-time Qt5 visualizer (pyqtgraph; BasicSim and other bridges)"
 
     def configure_parser(self, parser) -> None:

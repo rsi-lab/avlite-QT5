@@ -57,8 +57,8 @@ def window(qapp, tmp_path, monkeypatch):
 @pytest.mark.requires_data
 def test_registers_qt_app_strategy():
     ensure_plugin_loaded()
-    cls = AppStrategy.registry["qt"]
-    assert cls.cli_name == "qt"
+    cls = AppStrategy.registry["qt5"]
+    assert cls.cli_name == "qt5"
     assert cls.__module__.startswith("avlite.plugins.avlite_QT5")
 
 
@@ -329,4 +329,4 @@ def test_module_entrypoint_resolves_app():
     ensure_plugin_loaded()
     import avlite.plugins.avlite_QT5 as plugin
 
-    assert plugin.VisualizationQtApp is AppStrategy.registry["qt"]
+    assert plugin.VisualizationQtApp is AppStrategy.registry["qt5"]

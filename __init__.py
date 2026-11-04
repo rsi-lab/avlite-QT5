@@ -3,7 +3,7 @@
 AVLite loads this directory as ``avlite.plugins.avlite_QT5`` when it is installed
 under the community plugin path (``~/.local/share/avlite/plugins/avlite-QT5``)
 or listed in ``c62_community_plugins``. Importing the package registers
-``VisualizationQtApp`` (``cli_name = "qt"``).
+``VisualizationQtApp`` (``cli_name = "qt5"``).
 
 Stock AVLite only auto-imports built-in ``p60_*`` packages before parsing
 ``avlite <command>``. Launch this app with::

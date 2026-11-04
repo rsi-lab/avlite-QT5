@@ -3,7 +3,7 @@
 Qt5 visualizer for [AVLite](https://github.com/AV-Lab/avlite). Same BasicSim workflow as the built-in Tk app (map, vehicle, plans, trajectories, stack controls, profiles), drawn with **pyqtgraph** instead of Matplotlib.
 
 **Registry name:** `avlite-QT5`  
-**Category:** `AppStrategy` (`cli_name = "qt"`)
+**Category:** `AppStrategy` (`cli_name = "qt5"`)
 
 ## Why PyQt5
 
@@ -31,7 +31,7 @@ This repository ships [avlite-QT5.yaml](avlite-QT5.yaml). On Install/Update, AVL
 
 ## Launch
 
-Built-in `p60_*` packages are the only apps imported before `avlite` parses subcommands, so a community `AppStrategy` is started with:
+The app registers as `qt5` (`avlite qt5`). Stock AVLite 0.6.6 imports only built-in `p60_*` packages before it parses subcommands, so until core loads registered community apps first, start this one with:
 
 ```bash
 python -m avlite.plugins.avlite_QT5
@@ -48,7 +48,7 @@ Headless tests: `QT_QPA_PLATFORM=offscreen python3 -m pytest test/test_feature_p
 
 | Feature | Status |
 |---|---|
-| Registers `AppStrategy` cli `qt` via community import | pass |
+| Registers `AppStrategy` cli `qt5` via community import | pass |
 | BasicSim stack (default profile) | pass |
 | Global plot: ego marker + raceline | pass |
 | Global plan left/right boundaries | pass |
