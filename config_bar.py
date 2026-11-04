@@ -207,65 +207,14 @@ def _install() -> None:
             self.root.reload_stack(reload_code=True)
 
         def open_plugins(self) -> None:
-            dlg = QtWidgets.QDialog(self.root.win)
-            dlg.setWindowTitle("Community Plugins")
-            dlg.resize(640, 360)
-            layout = QtWidgets.QVBoxLayout(dlg)
-            layout.addWidget(QtWidgets.QLabel("Registered community plugins (c62_community_plugins):"))
-            table = QtWidgets.QTableWidget(0, 2)
-            table.setHorizontalHeaderLabels(["Name", "Path"])
-            plugins = dict(AppSettings.c62_community_plugins or {})
-            table.setRowCount(len(plugins))
-            for row, (name, path) in enumerate(plugins.items()):
-                table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(name)))
-                table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(path)))
-            table.horizontalHeader().setStretchLastSection(True)
-            layout.addWidget(table)
-            close = QtWidgets.QPushButton("Close")
-            close.clicked.connect(dlg.accept)
-            layout.addWidget(close)
-            dlg.exec_()
+            from .plugin_browser import open_plugin_browser
+
+            open_plugin_browser(self.root)
 
         def open_settings(self) -> None:
-            dlg = QtWidgets.QDialog(self.root.win)
-            dlg.setWindowTitle("Settings")
-            dlg.resize(420, 280)
-            form = QtWidgets.QFormLayout(dlg)
-            s = self.root.setting
-            nxt = QtWidgets.QComboBox()
-            profiles = list_profiles(AppSettings) or ["default"]
-            nxt.addItems(profiles)
-            idx = nxt.findText(str(s.p60_next_profile.get() or "default"))
-            nxt.setCurrentIndex(idx if idx >= 0 else 0)
+            from .schema_editor import open_schema_settings
 
-            def _next(name: str) -> None:
-                if name:
-                    s.p60_next_profile.set(name)
-
-            nxt.currentTextChanged.connect(_next)
-            form.addRow("Next profile (F)", nxt)
-
-            def _spin(attr: str, lo: float, hi: float) -> QtWidgets.QDoubleSpinBox:
-                spin = QtWidgets.QDoubleSpinBox()
-                spin.setRange(lo, hi)
-                spin.setValue(float(getattr(s, attr)))
-                spin.valueChanged.connect(lambda v, a=attr: setattr(s, a, float(v)))
-                return spin
-
-            form.addRow("XY zoom", _spin("p66_xy_zoom", 5, 500))
-            form.addRow("Frenet zoom", _spin("p66_frenet_zoom", 5, 500))
-            form.addRow("Global zoom", _spin("p66_global_zoom", 5, 5000))
-            slow = QtWidgets.QDoubleSpinBox()
-            slow.setRange(0.05, 2.0)
-            slow.setSingleStep(0.05)
-            slow.setValue(float(s.p69_mouse_drag_slowdown_factor))
-            slow.valueChanged.connect(lambda v: setattr(s, "p69_mouse_drag_slowdown_factor", float(v)))
-            form.addRow("Drag slowdown", slow)
-            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-            buttons.rejected.connect(dlg.reject)
-            buttons.accepted.connect(dlg.accept)
-            form.addRow(buttons)
-            dlg.exec_()
+            open_schema_settings(self.root)
 
 
 def __getattr__(name: str):

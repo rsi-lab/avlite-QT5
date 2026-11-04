@@ -9,8 +9,10 @@ from avlite.c60_apps.c64_settings_schema import SettingsSchema
 
 class PluginSettingsSchema(SettingsSchema):
     p60_dark_mode: bool = Field(default=True, description="Use dark UI theme.")
+    p60_hide_menubar: bool = Field(default=False, description="Hide the window menu bar.")
     p60_shortcut_mode: bool = Field(default=False, description="Collapse stack panels; show shortcut help.")
     p60_next_profile: str = Field(default="default", description="Profile switched to with shortcut F.")
+    p60_shortcuts: dict = Field(default_factory=dict, description="Shortcut id to key sequence overrides.")
     p69_mouse_drag_slowdown_factor: float = Field(
         default=0.5, description="Slowdown factor when dragging plots with the mouse."
     )
@@ -38,6 +40,9 @@ class PluginSettingsSchema(SettingsSchema):
     p66_show_lidar_frenet: bool = Field(default=False, description="Show LiDAR in Frenet view.")
     p66_show_lidar_clusters: bool = Field(default=True, description="Highlight LiDAR clusters.")
     p66_show_race_boundary: bool = Field(default=True, description="Show race/track boundary.")
+    p66_global_plan_velocity_scale: str = Field(
+        default="relative", description="Global-plan speed colors: relative or absolute."
+    )
     p66_xy_zoom: float = Field(default=30.0, description="Local XY zoom (half-width, m).")
     p66_frenet_zoom: float = Field(default=30.0, description="Frenet zoom (half-width, m).")
     p66_global_zoom: float = Field(default=30.0, description="Global plot zoom (half-width, m).")
@@ -46,6 +51,9 @@ class PluginSettingsSchema(SettingsSchema):
     p67_show_local_frenet_view: bool = Field(default=True, description="Show local Frenet sub-view.")
     p67_show_occupancy_map: bool = Field(default=False, description="Show occupancy map overlay.")
     p67_show_prediction: bool = Field(default=True, description="Show predicted trajectories.")
+    p67_show_perception_extras: bool = Field(
+        default=True, description="Show perception extras (clusters, occupancy, predictions)."
+    )
     p67_global_plan_view: bool = Field(default=True, description="Show global plan panel.")
     p67_local_plan_view: bool = Field(default=True, description="Show local plan panel.")
 

@@ -48,6 +48,281 @@ def _agent_list(pm) -> list:
     return list(getattr(pm, "agents", []) or [])
 
 
+def _nan_join(paths: list[np.ndarray]) -> tuple[list[float], list[float]]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for path in paths:
+        arr = np.asarray(path, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
+            continue
+        xs.extend(arr[:, 0].tolist())
+        xs.append(np.nan)
+        ys.extend(arr[:, 1].tolist())
+        ys.append(np.nan)
+    return xs, ys
+
+
+def _to_sd(gt, xy: np.ndarray) -> np.ndarray:
+    if gt is None or xy is None or len(xy) == 0:
+        return np.zeros((0, 2))
+    try:
+        sd = np.asarray(gt.convert_xy_path_to_sd_path_np(np.asarray(xy, dtype=float)[:, :2]), dtype=float)
+    except Exception:
+        return np.zeros((0, 2))
+    if sd.ndim != 2 or sd.shape[1] < 2:
+        return np.zeros((0, 2))
+    return sd[:, :2]
+
+
+def _segments_xy(segs) -> tuple[list[float], list[float]]:
+    arr = np.asarray(segs, dtype=float) if segs is not None else np.zeros((0, 2, 2))
+    if arr.ndim != 3 or arr.shape[-1] < 2 or arr.shape[-2] < 2:
+        return [], []
+    paths = [arr[i, :, :2] for i in range(arr.shape[0])]
+    return _nan_join(paths)
+
+
+def _track_segments(world, plan):
+    segs = getattr(world, "boundary_segments", None) if world is not None else None
+    if segs is not None and len(segs):
+        return segs
+    if plan is None:
+        return None
+    try:
+        from avlite.c40_execution.c46_basic_sim import boundary_segments_from_global_plan
+
+        return boundary_segments_from_global_plan(plan)
+    except Exception:
+        return None
+
+
+def _cluster_xy(pm) -> np.ndarray | None:
+    raw = getattr(pm, "detection_clusters", None) if pm is not None else None
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        parts = []
+        for item in raw:
+            arr = np.asarray(item, dtype=float)
+            if arr.ndim == 1 and arr.size >= 2:
+                parts.append(arr[:2].reshape(1, 2))
+            elif arr.ndim == 2 and arr.shape[1] >= 2 and len(arr):
+                parts.append(arr[:, :2])
+        if not parts:
+            return None
+        return np.vstack(parts)
+    arr = np.asarray(raw, dtype=float)
+    if arr.ndim == 2 and arr.shape[1] >= 2 and len(arr):
+        return arr[:, :2]
+    return None
+
+
+def _forecast_modes(pred) -> list[tuple[object, int, np.ndarray, float]]:
+    """``(agent_id, mode, Nx2 path, weight)`` from Single/Multi/GP/GMM forecasts."""
+    if pred is None:
+        return []
+    weights = getattr(pred, "weights", None) or {}
+    store = getattr(pred, "trajectories", None)
+    if store is None:
+        store = getattr(pred, "means", None)
+    if not isinstance(store, dict):
+        return []
+    out: list[tuple[object, int, np.ndarray, float]] = []
+    for aid, modes in store.items():
+        arr = np.asarray(modes, dtype=float)
+        if arr.ndim == 2 and arr.shape[-1] >= 2:
+            arr = arr.reshape(1, arr.shape[0], arr.shape[1])
+        if arr.ndim != 3 or arr.shape[-1] < 2:
+            continue
+        w = np.asarray(weights.get(aid, []), dtype=float) if isinstance(weights, dict) else np.array([])
+        for i in range(arr.shape[0]):
+            weight = float(np.clip(w[i], 0.0, 1.0)) if i < len(w) else 1.0
+            out.append((aid, i, arr[i, :, :2], weight))
+    return out
+
+
+def _ellipse_polygon(center: np.ndarray, cov: np.ndarray, percentile: float, n: int = 16) -> np.ndarray | None:
+    if not 0.0 < percentile < 1.0:
+        return None
+    sym = np.asarray(cov, dtype=float)
+    if sym.shape != (2, 2) or not np.all(np.isfinite(sym)):
+        return None
+    sym = 0.5 * (sym + sym.T)
+    vals, vecs = np.linalg.eigh(sym)
+    vals = np.clip(vals, 0.0, None)
+    if float(vals[-1]) <= 0.0:
+        return None
+    radii = np.sqrt(-2.0 * np.log(1.0 - percentile)) * np.sqrt(vals)
+    theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    local = np.column_stack((np.cos(theta), np.sin(theta))) * radii
+    polygon = np.asarray(center, dtype=float) + local @ vecs.T
+    return np.vstack((polygon, polygon[:1]))
+
+
+def _step_covariance(pred, agent_id, mode_index: int, step: int) -> np.ndarray | None:
+    joint = getattr(pred, "covariance", None)
+    if isinstance(joint, dict) and agent_id in joint:
+        mat = np.asarray(joint[agent_id])
+        i = 2 * step
+        if mat.ndim == 2 and mat.shape[0] >= i + 2 and mat.shape[1] >= i + 2:
+            return mat[i:i + 2, i:i + 2]
+    covs = getattr(pred, "covariances", None)
+    if isinstance(covs, dict) and agent_id in covs:
+        mat = np.asarray(covs[agent_id])
+        if mat.ndim == 4 and mode_index < mat.shape[0] and step < mat.shape[1]:
+            return mat[mode_index, step]
+    return None
+
+
+def _occupancy_grid(pm):
+    om = getattr(pm, "occupancy_map", None) if pm is not None else None
+    if om is None or getattr(om, "grid", None) is None:
+        fallback = getattr(pm, "map", None) if pm is not None else None
+        if fallback is not None and getattr(fallback, "grid", None) is not None and hasattr(fallback, "origin_x"):
+            om = fallback
+    if om is None or getattr(om, "grid", None) is None or np.size(om.grid) == 0:
+        return None
+    return om
+
+
+def _flow_image(pred):
+    """Max-over-horizon occupancy, matching the Tk occupancy-flow painter."""
+    if pred is None:
+        return None
+    flow = getattr(pred, "occupancy_flow", None)
+    if flow is None:
+        return None
+    origin = (
+        float(getattr(pred, "origin_x", 0.0)),
+        float(getattr(pred, "origin_y", 0.0)),
+        float(getattr(pred, "resolution", 0.25) or 0.25),
+    )
+    if isinstance(flow, dict):
+        series = [steps for steps in flow.values() if steps]
+        if not series:
+            return None
+        n_steps = max(len(steps) for steps in series)
+        acc = None
+        for step in range(n_steps):
+            union = None
+            for steps in series:
+                if step >= len(steps) or np.size(steps[step]) == 0:
+                    continue
+                grid = np.clip(np.asarray(steps[step], dtype=float), 0.0, 1.0)
+                union = grid if union is None else 1.0 - (1.0 - union) * (1.0 - grid)
+            if union is None:
+                continue
+            acc = union if acc is None else np.maximum(acc, union)
+        if acc is None:
+            return None
+        return acc, origin
+    grids = [np.asarray(g, dtype=float) for g in flow if np.size(g)]
+    if not grids:
+        return None
+    return np.maximum.reduce(grids), origin
+
+
+def _lattice_edges(lp) -> list:
+    lattice = getattr(lp, "lattice", None)
+    edges = getattr(lattice, "edges", None) if lattice is not None else None
+    if not edges:
+        edges = getattr(lp, "lattice_edges", None) or getattr(lp, "edges", None) or []
+    return list(edges)
+
+
+def _edge_xy(edge) -> np.ndarray:
+    traj = getattr(edge, "local_trajectory", None) or getattr(edge, "trajectory", None)
+    if traj is not None and getattr(traj, "path_x", None) is not None:
+        x, y = _safe_xy(traj.path_x, traj.path_y)
+        return np.column_stack([x, y]) if len(x) else np.zeros((0, 2))
+    pts = getattr(edge, "points_xy", None) or getattr(edge, "xy", None)
+    if pts is None:
+        return np.zeros((0, 2))
+    arr = np.asarray(pts, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return np.zeros((0, 2))
+    return arr[:, :2]
+
+
+def _edge_sd(edge) -> np.ndarray:
+    traj = getattr(edge, "local_trajectory", None)
+    if traj is None:
+        return np.zeros((0, 2))
+    x, y = _safe_xy(getattr(traj, "path_s_from_parent", None), getattr(traj, "path_d_from_parent", None))
+    return np.column_stack([x, y]) if len(x) else np.zeros((0, 2))
+
+
+def _edge_kind(edge, lp) -> str:
+    if getattr(edge, "collision", False) or getattr(edge, "boundary_violation", False):
+        return "collision"
+    feasible = True
+    fn = getattr(lp, "_is_curvature_feasible", None)
+    if callable(fn):
+        try:
+            feasible = bool(fn(edge))
+        except Exception:
+            feasible = True
+    return "feasible" if feasible else "kinematic"
+
+
+def _local_plan_paths(lp) -> list[np.ndarray]:
+    paths: list[np.ndarray] = []
+    if lp is None:
+        return paths
+    if getattr(lp, "selected_local_plan", None) is not None:
+        edge = lp.selected_local_plan
+        for _ in range(8):
+            if edge is None:
+                break
+            xy = _edge_xy(edge)
+            if len(xy):
+                paths.append(xy)
+            edge = getattr(edge, "selected_next_local_plan", None)
+        if paths:
+            return paths
+    local_plan = getattr(lp, "local_plan", None)
+    getter = getattr(lp, "get_local_plan", None)
+    if callable(getter):
+        try:
+            got = getter()
+            if got is not None:
+                local_plan = got
+        except Exception:
+            pass
+    if local_plan is None:
+        return paths
+    traj = local_plan.as_trajectory() if hasattr(local_plan, "as_trajectory") else getattr(local_plan, "trajectory", None)
+    if traj is None or getattr(traj, "path_x", None) is None:
+        return paths
+    x, y = _safe_xy(traj.path_x, traj.path_y)
+    if len(x):
+        paths.append(np.column_stack([x, y]))
+    return paths
+
+
+def _velocity_colors(speed: np.ndarray, scale: str) -> list[tuple[int, int, int, int]]:
+    v = np.asarray(speed, dtype=float)
+    if scale == "absolute":
+        t = np.clip(v / 30.0, 0.0, 1.0)
+    else:
+        finite = v[np.isfinite(v)]
+        if len(finite) == 0 or float(np.max(finite) - np.min(finite)) < 1e-6:
+            t = np.zeros_like(v)
+        else:
+            lo, hi = float(np.min(finite)), float(np.max(finite))
+            t = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
+    colors = []
+    for u in t:
+        if not np.isfinite(u):
+            colors.append((80, 80, 80, 0))
+            continue
+        r = int(40 + 215 * u)
+        g = int(80 + 140 * (1.0 - abs(u - 0.5) * 2.0))
+        b = int(220 * (1.0 - u))
+        colors.append((r, g, b, 230))
+    return colors
+
+
 def _pin_plot_chrome(plot) -> None:
     """Freeze axis pixels and turn off auto-range.
 
@@ -142,12 +417,38 @@ def _install_widgets() -> None:
             self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2))
             self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2))
             self.global_plan = self.plotItem.plot(pen=pg.mkPen("#4fc3f7", width=3))
+            self.global_plan_speed = pg.ScatterPlotItem(size=7, pen=None, pxMode=True)
+            self.addItem(self.global_plan_speed)
             self.hdmap_lanes: list[pg.PlotDataItem] = []
+            self._lane_cache: list[tuple] = []
+            self.hd_closest = self.plotItem.plot(pen=pg.mkPen("#ffeb3b", width=3))
+            self.hd_text = pg.TextItem(color="#ffeb3b", anchor=(0, 1))
+            self.addItem(self.hd_text)
+            self.hd_text.hide()
             self.ego_box = self.plotItem.plot(pen=pg.mkPen("r", width=2))
             self.ego_marker = self.plotItem.plot(pen=None, symbol="o", symbolBrush="r", symbolSize=10)
+            self.heading_line = self.plotItem.plot(pen=pg.mkPen("#ef5350", width=2))
+            self.planner_marker = self.plotItem.plot(
+                pen=None, symbol="t", symbolBrush="#ce93d8", symbolSize=12,
+            )
+            self.planner_text = pg.TextItem("L", color="#ce93d8", anchor=(0.5, 1.4))
+            self.addItem(self.planner_text)
+            self.planner_text.hide()
             self.past_path = self.plotItem.plot(pen=pg.mkPen("#66bb6a", width=1.5))
             self.start_marker = self.plotItem.plot(pen=None, symbol="o", symbolBrush="b", symbolSize=14)
             self.goal_marker = self.plotItem.plot(pen=None, symbol="o", symbolBrush="g", symbolSize=14)
+            self.start_text = pg.TextItem("S", color="#64b5f6", anchor=(0.5, 1.6))
+            self.goal_text = pg.TextItem("G", color="#81c784", anchor=(0.5, 1.6))
+            self.addItem(self.start_text)
+            self.addItem(self.goal_text)
+            self.start_text.hide()
+            self.goal_text.hide()
+            self.g_wp_current = self.plotItem.plot(
+                pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=14,
+            )
+            self.g_wp_next = self.plotItem.plot(
+                pen=None, symbol="+", symbolPen=pg.mkPen("#90caf9", width=2), symbolSize=14,
+            )
             self.hover_marker = self.plotItem.plot(pen=None, symbol="o", symbolBrush="w", symbolSize=8)
             self.hover_text = pg.TextItem(color="w", anchor=(0, 1))
             self.addItem(self.hover_text)
@@ -174,10 +475,18 @@ def _install_widgets() -> None:
             for item in self.hdmap_lanes:
                 self.removeItem(item)
             self.hdmap_lanes.clear()
+            self._lane_cache.clear()
+            self.global_plan_speed.setData([], [])
+            self.hd_closest.setData([], [])
+            self.hd_text.hide()
+            self.planner_text.hide()
+            self.start_text.hide()
+            self.goal_text.hide()
             for curve in (
                 self.left_boundary, self.right_boundary, self.global_plan,
                 self.ego_box, self.ego_marker, self.past_path,
-                self.start_marker, self.goal_marker,
+                self.start_marker, self.goal_marker, self.heading_line,
+                self.planner_marker, self.g_wp_current, self.g_wp_next,
             ):
                 curve.setData([], [])
 
@@ -297,12 +606,19 @@ def _install_widgets() -> None:
                 self._start_point = (x, y)
                 self.start_marker.setData([x], [y])
                 self.goal_marker.setData([], [])
+                self.start_text.setPos(x, y)
+                self.start_text.show()
+                self.goal_text.hide()
                 log.info("Set start: %s", self._start_point)
                 return
             start = self._start_point
             goal = (x, y)
             self.start_marker.setData([start[0]], [start[1]])
             self.goal_marker.setData([goal[0]], [goal[1]])
+            self.start_text.setPos(start[0], start[1])
+            self.goal_text.setPos(goal[0], goal[1])
+            self.start_text.show()
+            self.goal_text.show()
             gp = self.root.exec.global_planner
             gp.set_start_goal(start_point=start, goal_point=goal)
             log.info("Set start: %s, goal: %s", start, goal)
@@ -345,7 +661,101 @@ def _install_widgets() -> None:
             if status is not None:
                 status.set(text)
 
+        def _paint_plan_speed(self, xs, ys, vel) -> None:
+            if vel is None or len(xs) == 0:
+                self.global_plan_speed.setData([], [])
+                return
+            n = min(len(xs), len(vel))
+            step = max(1, n // 400)
+            scale = str(getattr(self.root.setting.schema, "p66_global_plan_velocity_scale", "relative"))
+            colors = _velocity_colors(np.asarray(vel[:n])[::step], scale)
+            brushes = [pg.mkBrush(*c) for c in colors]
+            self.global_plan_speed.setData(xs[:n:step], ys[:n:step], brush=brushes)
+
+        def _paint_waypoints(self, stack, plan) -> None:
+            gt = None
+            if stack.local_planner is not None:
+                gt = getattr(stack.local_planner, "global_trajectory", None)
+            if gt is None and plan is not None:
+                gt = getattr(plan, "trajectory", None)
+            if gt is None or not hasattr(gt, "current_wp"):
+                self.g_wp_current.setData([], [])
+                self.g_wp_next.setData([], [])
+                return
+            try:
+                i = int(gt.current_wp)
+                j = int(getattr(gt, "next_wp", i + 1))
+                xs = np.asarray(gt.path_x, dtype=float)
+                ys = np.asarray(gt.path_y, dtype=float)
+            except Exception:
+                self.g_wp_current.setData([], [])
+                self.g_wp_next.setData([], [])
+                return
+            if 0 <= i < len(xs):
+                self.g_wp_current.setData([float(xs[i])], [float(ys[i])])
+            else:
+                self.g_wp_current.setData([], [])
+            if 0 <= j < len(xs):
+                self.g_wp_next.setData([float(xs[j])], [float(ys[j])])
+            else:
+                self.g_wp_next.setData([], [])
+
+        def _paint_heading(self, ego, setting) -> None:
+            if not setting.p66_show_state.get():
+                self.heading_line.setData([], [])
+                return
+            ctrl = getattr(self.root.exec, "controller", None)
+            front = float(getattr(ctrl, "ego_distance_front_axle", 2.5) or 2.5)
+            length = float(getattr(ego, "length", front + 1.0) or (front + 1.0))
+            rear = max(length - front, 0.0)
+            c, s = float(np.cos(ego.theta)), float(np.sin(ego.theta))
+            self.heading_line.setData(
+                [ego.x + front * c, ego.x - rear * c],
+                [ego.y + front * s, ego.y - rear * s],
+            )
+
+        def _paint_planner_loc(self, stack, setting) -> None:
+            lp = stack.local_planner
+            loc = getattr(lp, "location_xy", None) if lp is not None else None
+            if loc is None:
+                self.planner_marker.setData([], [])
+                self.planner_text.hide()
+                return
+            x, y = float(loc[0]), float(loc[1])
+            self.planner_marker.setData([x], [y])
+            self.planner_text.setPos(x, y)
+            self.planner_text.show()
+
+        def _update_hd_hover(self, x: float, y: float) -> None:
+            if not self._lane_cache:
+                self.hd_closest.setData([], [])
+                self.hd_text.hide()
+                return
+            best = None
+            best_d = (float(self.root.setting.p66_global_zoom) * 0.08) ** 2
+            for xs, ys, lane_id, road_id, pred, succ in self._lane_cache:
+                if len(xs) == 0:
+                    continue
+                step = max(1, len(xs) // 80)
+                d2 = (xs[::step] - x) ** 2 + (ys[::step] - y) ** 2
+                i = int(np.argmin(d2))
+                if float(d2[i]) < best_d:
+                    best_d = float(d2[i])
+                    best = (xs, ys, lane_id, road_id, pred, succ)
+            if best is None:
+                self.hd_closest.setData([], [])
+                self.hd_text.hide()
+                return
+            xs, ys, lane_id, road_id, pred, succ = best
+            self.hd_closest.setData(xs, ys)
+            pred_s = ",".join(str(p) for p in list(pred)[:4]) if pred else "—"
+            succ_s = ",".join(str(p) for p in list(succ)[:4]) if succ else "—"
+            self.hd_text.setText(f"lane {lane_id}  road {road_id}\npred {pred_s}\nsucc {succ_s}")
+            self.hd_text.setPos(x, y)
+            self.hd_text.show()
+
         def _on_mouse_moved(self, pos):
+            self._update_hd_hover(float(pos.x()), float(pos.y()))
             if self._hover_plan_xy is None or len(self._hover_plan_xy) == 0:
                 self.hover_marker.setData([], [])
                 self.hover_text.hide()
@@ -359,7 +769,7 @@ def _install_widgets() -> None:
                 self.hover_text.hide()
                 return
             x, y = xy[i]
-            v = float(self._hover_plan_v[i]) if self._hover_plan_v is not None else 0.0
+            v = float(self._hover_plan_v[i]) if self._hover_plan_v is not None and i < len(self._hover_plan_v) else 0.0
             self.hover_marker.setData([x], [y])
             self.hover_text.setText(f"{v:.1f} m/s ({v * 3.6:.0f} km/h)")
             self.hover_text.setPos(x, y)
@@ -395,6 +805,7 @@ def _install_widgets() -> None:
             # HD map lanes (static-ish; redraw when empty)
             gp = stack.global_planner
             if gp is not None and hasattr(gp, "hdmap") and gp.hdmap is not None and not self.hdmap_lanes:
+                self._lane_cache.clear()
                 for lane in gp.hdmap.lanes:
                     color = "#427b58" if lane.type == "driving" else (
                         "#af3a03" if lane.type == "shoulder" else "#777777"
@@ -406,6 +817,15 @@ def _install_widgets() -> None:
                     )
                     item.setOpacity(alpha)
                     self.hdmap_lanes.append(item)
+                    xs = np.asarray(lane.center_line[0], dtype=float)
+                    ys = np.asarray(lane.center_line[1], dtype=float)
+                    self._lane_cache.append((
+                        xs, ys,
+                        getattr(lane, "id", ""),
+                        getattr(lane, "road_id", getattr(lane, "road", "")),
+                        getattr(lane, "predecessors", ()),
+                        getattr(lane, "successors", ()),
+                    ))
                 all_x = [c for lane in gp.hdmap.lanes for c in lane.center_line[0]]
                 all_y = [c for lane in gp.hdmap.lanes for c in lane.center_line[1]]
                 if all_x and all_y:
@@ -417,10 +837,21 @@ def _install_widgets() -> None:
                 self.global_plan.setData(xs, ys)
                 if len(xs):
                     self._hover_plan_xy = np.column_stack([xs, ys])
-                    self._hover_plan_v = np.asarray(traj.velocity, dtype=float).ravel()[: len(xs)]
+                    vel = getattr(traj, "velocity", None)
+                    self._hover_plan_v = (
+                        np.asarray(vel, dtype=float).ravel()[: len(xs)] if vel is not None else None
+                    )
+                    self._paint_plan_speed(xs, ys, self._hover_plan_v)
+                else:
+                    self.global_plan_speed.setData([], [])
             else:
                 self.global_plan.setData([], [])
+                self.global_plan_speed.setData([], [])
                 self._hover_plan_xy = None
+
+            self._paint_waypoints(stack, plan)
+            self._paint_heading(ego, setting)
+            self._paint_planner_loc(stack, setting)
 
             # Ego
             if setting.p66_show_state.get():
@@ -477,6 +908,7 @@ def _install_widgets() -> None:
 
             self.xy_plot = pg.PlotWidget(background=root.setting.p60_bg_color)
             self.frenet_plot = pg.PlotWidget(background=root.setting.p60_bg_color)
+            self.layer_point_counts: dict[str, int] = {}
             for pw, xlabel, ylabel in (
                 (self.xy_plot, "x (m)", "y (m)"),
                 (self.frenet_plot, "s (m)", "d (m)"),
@@ -487,6 +919,14 @@ def _install_widgets() -> None:
                 _pin_plot_chrome(pw)
             layout.addWidget(self.xy_plot, 1)
             layout.addWidget(self.frenet_plot, 1)
+            self.legend = QtWidgets.QLabel(
+                "orange/tan boundary · cyan plan · red ego · green past · "
+                "lime lidar · yellow clusters · orange ahead / purple behind prediction · "
+                "green feasible / blue kinematic / red collision lattice"
+            )
+            self.legend.setObjectName("plotLegend")
+            self.legend.setWordWrap(True)
+            layout.addWidget(self.legend)
 
             self._init_curves()
             self._last_draw_ms = 0.0
@@ -515,12 +955,48 @@ def _install_widgets() -> None:
             self.xy_clusters = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(255, 255, 0, 220), pen=None)
             self.xy_plot.addItem(self.xy_clusters)
             self.xy_pred = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine)
+                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
+            )
+            self.xy_pred_behind = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen("#7e57c2", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
+            )
+            self.xy_ellipses = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen("#ff9800", width=1), connect="finite",
             )
             self.xy_past = self.xy_plot.plotItem.plot(pen=pg.mkPen("#66bb6a", width=1.5))
             self.xy_lattice = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#90caf9", width=1), connect="finite"
+                pen=pg.mkPen("#8ec07c", width=1), connect="finite",
             )
+            self.xy_lattice_hit = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen("#b22222", width=1), connect="finite",
+            )
+            self.xy_lattice_kin = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen("#4169e1", width=1), connect="finite",
+            )
+            self.xy_track = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen("#bdbdbd", width=1), connect="finite",
+            )
+            self.xy_heading = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=2))
+            self.xy_wp = self.xy_plot.plotItem.plot(
+                pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=12,
+            )
+            self.xy_wp_next = self.xy_plot.plotItem.plot(
+                pen=None, symbol="+", symbolPen=pg.mkPen("#90caf9", width=2), symbolSize=12,
+            )
+            self.xy_lwp = self.xy_plot.plotItem.plot(
+                pen=None, symbol="o", symbolBrush=None, symbolPen=pg.mkPen("#ef5350", width=2), symbolSize=10,
+            )
+            self.xy_lwp_next = self.xy_plot.plotItem.plot(
+                pen=None, symbol="s", symbolBrush=None, symbolPen=pg.mkPen("#ef9a9a", width=2), symbolSize=9,
+            )
+            self.xy_occ = pg.ImageItem()
+            self.xy_flow = pg.ImageItem()
+            self.xy_plot.addItem(self.xy_occ)
+            self.xy_plot.addItem(self.xy_flow)
+            self.xy_occ.setZValue(-20)
+            self.xy_flow.setZValue(-10)
+            self.xy_occ.hide()
+            self.xy_flow.hide()
 
             self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=1))
             self.sd_right = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=1))
@@ -530,6 +1006,41 @@ def _install_widgets() -> None:
             self.sd_agents = [
                 self.frenet_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
             ]
+            self.sd_pred = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
+            )
+            self.sd_pred_behind = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#7e57c2", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
+            )
+            self.sd_ellipses = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#ff9800", width=1), connect="finite",
+            )
+            self.sd_lattice = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#8ec07c", width=1), connect="finite",
+            )
+            self.sd_lattice_hit = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#b22222", width=1), connect="finite",
+            )
+            self.sd_lattice_kin = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#4169e1", width=1), connect="finite",
+            )
+            self.sd_track = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen("#bdbdbd", width=1), connect="finite",
+            )
+            self.sd_wp = self.frenet_plot.plotItem.plot(
+                pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=12,
+            )
+            self.sd_wp_next = self.frenet_plot.plotItem.plot(
+                pen=None, symbol="+", symbolPen=pg.mkPen("#90caf9", width=2), symbolSize=12,
+            )
+            self.sd_lwp = self.frenet_plot.plotItem.plot(
+                pen=None, symbol="o", symbolBrush=None, symbolPen=pg.mkPen("#ef5350", width=2), symbolSize=10,
+            )
+            self.sd_lwp_next = self.frenet_plot.plotItem.plot(
+                pen=None, symbol="s", symbolBrush=None, symbolPen=pg.mkPen("#ef9a9a", width=2), symbolSize=9,
+            )
+            self.sd_clusters = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(255, 255, 0, 220), pen=None)
+            self.frenet_plot.addItem(self.sd_clusters)
             self.sd_lidar = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(50, 255, 50, 200), pen=None)
             self.frenet_plot.addItem(self.sd_lidar)
             ruler_pen = pg.mkPen("#00bcd4", width=1, style=QtCore.Qt.DashLine)
@@ -545,8 +1056,14 @@ def _install_widgets() -> None:
         def reset(self) -> None:
             for curve in (
                 self.xy_left, self.xy_right, self.xy_ref, self.xy_local, self.xy_ego,
-                self.xy_pred, self.xy_past, self.xy_lattice,
+                self.xy_pred, self.xy_pred_behind, self.xy_ellipses, self.xy_past,
+                self.xy_lattice, self.xy_lattice_hit, self.xy_lattice_kin,
+                self.xy_track, self.xy_heading, self.xy_wp, self.xy_wp_next,
+                self.xy_lwp, self.xy_lwp_next,
                 self.sd_left, self.sd_right, self.sd_ref, self.sd_local, self.sd_ego,
+                self.sd_pred, self.sd_pred_behind, self.sd_ellipses,
+                self.sd_lattice, self.sd_lattice_hit, self.sd_lattice_kin,
+                self.sd_track, self.sd_wp, self.sd_wp_next, self.sd_lwp, self.sd_lwp_next,
             ):
                 curve.setData([], [])
             for c in self.xy_agents + self.sd_agents:
@@ -554,6 +1071,10 @@ def _install_widgets() -> None:
             self.xy_lidar.setData([], [])
             self.xy_clusters.setData([], [])
             self.sd_lidar.setData([], [])
+            self.sd_clusters.setData([], [])
+            self.xy_occ.hide()
+            self.xy_flow.hide()
+            self.layer_point_counts.clear()
             self._hide_ruler()
 
         def update_theme(self, bg: str, fg: str) -> None:
@@ -566,6 +1087,7 @@ def _install_widgets() -> None:
             s = self.root.setting
             self.xy_plot.setVisible(bool(s.p67_show_local_global_view.get()))
             self.frenet_plot.setVisible(bool(s.p67_show_local_frenet_view.get()))
+            self.legend.setVisible(bool(s.p66_show_legend.get()))
 
         def _status(self, text: str) -> None:
             status = getattr(self.root.setting, "perception_status_text", None)
@@ -728,125 +1250,14 @@ def _install_widgets() -> None:
                 self.xy_ref.setData([], [])
                 self.sd_ref.setData([], [])
 
-            # Local plan
-            if lp is not None and s.p66_show_local_plan.get():
-                local_plan = getattr(lp, "local_plan", None)
-                traj = getattr(local_plan, "trajectory", None) if local_plan is not None else None
-                if traj is not None:
-                    self.xy_local.setData(*_safe_xy(traj.path_x, traj.path_y))
-                    if gt is not None:
-                        try:
-                            sd = gt.convert_xy_path_to_sd_path_np(
-                                np.column_stack([traj.path_x, traj.path_y])
-                            )
-                            self.sd_local.setData(sd[:, 0], sd[:, 1])
-                        except Exception:
-                            self.sd_local.setData([], [])
-                else:
-                    self.xy_local.setData([], [])
-                    self.sd_local.setData([], [])
-            else:
-                self.xy_local.setData([], [])
-                self.sd_local.setData([], [])
-
-            # Lattice
-            if lp is not None and s.p66_show_local_lattice.get():
-                edges = getattr(lp, "lattice_edges", None) or getattr(lp, "edges", None) or []
-                xs: list[float] = []
-                ys: list[float] = []
-                for edge in edges[:200]:
-                    pts = getattr(edge, "points_xy", None) or getattr(edge, "xy", None)
-                    if pts is None:
-                        continue
-                    arr = np.asarray(pts, dtype=float)
-                    if arr.ndim != 2 or arr.shape[0] < 2:
-                        continue
-                    xs.extend(arr[:, 0].tolist() + [np.nan])
-                    ys.extend(arr[:, 1].tolist() + [np.nan])
-                self.xy_lattice.setData(xs, ys)
-            else:
-                self.xy_lattice.setData([], [])
-
-            # Ego + agents
-            if s.p66_show_state.get():
-                self.xy_ego.setData(*_closed_poly(ego.get_bb_corners()))
-                if gt is not None:
-                    try:
-                        sd_c = gt.convert_xy_path_to_sd_path_np(ego.get_bb_corners())
-                        self.sd_ego.setData(*_closed_poly(sd_c))
-                    except Exception:
-                        self.sd_ego.setData([], [])
-                agents = _agent_list(stack.pm)[:12]
-                if not agents and getattr(stack, "world", None) is not None:
-                    agents = _agent_list(getattr(stack.world, "pm", None))[:12]
-                for i, curve in enumerate(self.xy_agents):
-                    if i < len(agents):
-                        curve.setData(*_closed_poly(agents[i].get_bb_corners()))
-                    else:
-                        curve.setData([], [])
-                if gt is not None:
-                    for i, curve in enumerate(self.sd_agents):
-                        if i < len(agents):
-                            try:
-                                sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
-                                curve.setData(*_closed_poly(sd_c))
-                            except Exception:
-                                curve.setData([], [])
-                        else:
-                            curve.setData([], [])
-            else:
-                self.xy_ego.setData([], [])
-                self.sd_ego.setData([], [])
-
-            # LiDAR
-            lidar_xy = None
-            try:
-                frame = stack.world.get_sensor_frame()
-                lidar = getattr(frame, "lidar", None)
-                pts = getattr(lidar, "points", None) if lidar is not None else None
-                if pts is not None and len(pts):
-                    arr = np.asarray(pts, dtype=float)
-                    if arr.ndim == 2 and arr.shape[1] >= 2:
-                        lidar_xy = arr[:, :2]
-            except Exception:
-                lidar_xy = None
-
-            if lidar_xy is not None and s.p66_show_lidar_global.get():
-                self.xy_lidar.setData(lidar_xy[:, 0], lidar_xy[:, 1])
-            else:
-                self.xy_lidar.setData([], [])
-            if lidar_xy is not None and s.p66_show_lidar_frenet.get() and gt is not None:
-                try:
-                    sd = gt.convert_xy_path_to_sd_path_np(lidar_xy)
-                    self.sd_lidar.setData(sd[:, 0], sd[:, 1])
-                except Exception:
-                    self.sd_lidar.setData([], [])
-            else:
-                self.sd_lidar.setData([], [])
-
-            # Predictions (first mode polylines flattened)
-            if s.p67_show_prediction.get() and stack.pm is not None:
-                pred_x: list[float] = []
-                pred_y: list[float] = []
-                for agent in _agent_list(stack.pm):
-                    pred = getattr(agent, "prediction", None)
-                    traj = None
-                    if pred is not None:
-                        if hasattr(pred, "trajectories") and pred.trajectories:
-                            traj = pred.trajectories[0]
-                        elif hasattr(pred, "trajectory"):
-                            traj = pred.trajectory
-                    if traj is None:
-                        continue
-                    xs = getattr(traj, "path_x", None)
-                    ys = getattr(traj, "path_y", None)
-                    if xs is None:
-                        continue
-                    pred_x.extend(list(xs) + [np.nan])
-                    pred_y.extend(list(ys) + [np.nan])
-                self.xy_pred.setData(pred_x, pred_y)
-            else:
-                self.xy_pred.setData([], [])
+            self._paint_local_plan(lp, gt, s)
+            self._paint_lattice(lp, gt, s)
+            self._paint_track(stack, plan, gt, s)
+            self._paint_ego(stack, ego, gt, s)
+            self._paint_lidar(stack, gt, s)
+            self._paint_clusters(stack, gt, s)
+            self._paint_predictions(stack, ego, gt, s)
+            self._paint_occupancy(stack, s)
 
             # View windows. Equal scale from the pinned view box, not auto-range.
             zoom = float(s.p66_xy_zoom)
@@ -870,6 +1281,320 @@ def _install_widgets() -> None:
 
             self._last_draw_ms = (time.perf_counter() - t0) * 1000.0
             return self._last_draw_ms
+
+        def _count(self, name: str, xs) -> None:
+            self.layer_point_counts[name] = int(np.count_nonzero(np.isfinite(np.asarray(xs, dtype=float)))) if len(xs) else 0
+
+        def _paint_local_plan(self, lp, gt, s) -> None:
+            paths = _local_plan_paths(lp) if lp is not None and s.p66_show_local_plan.get() else []
+            xs, ys = _nan_join(paths)
+            self.xy_local.setData(xs, ys)
+            self._count("local_plan_xy", xs)
+            if gt is not None and paths:
+                sd_paths = [_to_sd(gt, p) for p in paths]
+                sx, sy = _nan_join(sd_paths)
+                self.sd_local.setData(sx, sy)
+            else:
+                self.sd_local.setData([], [])
+            self._paint_local_waypoints(lp, gt, s, paths)
+
+        def _paint_local_waypoints(self, lp, gt, s, paths) -> None:
+            self.xy_lwp.setData([], [])
+            self.xy_lwp_next.setData([], [])
+            self.sd_lwp.setData([], [])
+            self.sd_lwp_next.setData([], [])
+            self.xy_wp.setData([], [])
+            self.xy_wp_next.setData([], [])
+            self.sd_wp.setData([], [])
+            self.sd_wp_next.setData([], [])
+            if gt is not None and hasattr(gt, "current_wp") and getattr(gt, "path_x", None) is not None:
+                try:
+                    i = int(gt.current_wp)
+                    j = int(getattr(gt, "next_wp", i + 1))
+                    px = np.asarray(gt.path_x, dtype=float)
+                    py = np.asarray(gt.path_y, dtype=float)
+                    ps = np.asarray(getattr(gt, "path_s", px), dtype=float)
+                    pd = np.asarray(getattr(gt, "path_d", np.zeros_like(px)), dtype=float)
+                    if 0 <= i < len(px):
+                        self.xy_wp.setData([float(px[i])], [float(py[i])])
+                        self.sd_wp.setData([float(ps[i])], [float(pd[i])])
+                    if 0 <= j < len(px):
+                        self.xy_wp_next.setData([float(px[j])], [float(py[j])])
+                        self.sd_wp_next.setData([float(ps[j])], [float(pd[j])])
+                except Exception:
+                    pass
+            if not paths or lp is None:
+                return
+            local = None
+            getter = getattr(lp, "get_local_plan", None)
+            if callable(getter):
+                try:
+                    local = getter()
+                except Exception:
+                    local = None
+            traj = None
+            if local is not None and hasattr(local, "as_trajectory"):
+                try:
+                    traj = local.as_trajectory()
+                except Exception:
+                    traj = None
+            if traj is None or not hasattr(traj, "get_current_xy"):
+                return
+            try:
+                x, y = traj.get_current_xy()
+                x2, y2 = traj.get_xy_by_waypoint(int(traj.next_wp))
+                self.xy_lwp.setData([float(x)], [float(y)])
+                self.xy_lwp_next.setData([float(x2)], [float(y2)])
+                if gt is not None:
+                    s0, d0 = gt.convert_xy_to_sd(float(x), float(y))
+                    s1, d1 = gt.convert_xy_to_sd(float(x2), float(y2))
+                    self.sd_lwp.setData([float(s0)], [float(d0)])
+                    self.sd_lwp_next.setData([float(s1)], [float(d1)])
+            except Exception:
+                return
+
+        def _paint_lattice(self, lp, gt, s) -> None:
+            buckets = {"feasible": [], "collision": [], "kinematic": []}
+            sd_buckets = {"feasible": [], "collision": [], "kinematic": []}
+            if lp is not None and s.p66_show_local_lattice.get():
+                for edge in _lattice_edges(lp)[:240]:
+                    xy = _edge_xy(edge)
+                    if len(xy) < 2:
+                        continue
+                    kind = _edge_kind(edge, lp)
+                    buckets[kind].append(xy)
+                    sd = _edge_sd(edge)
+                    if len(sd) >= 2:
+                        sd_buckets[kind].append(sd)
+                    elif gt is not None:
+                        sd_buckets[kind].append(_to_sd(gt, xy))
+            mapping = (
+                ("feasible", self.xy_lattice, self.sd_lattice),
+                ("collision", self.xy_lattice_hit, self.sd_lattice_hit),
+                ("kinematic", self.xy_lattice_kin, self.sd_lattice_kin),
+            )
+            for kind, xy_item, sd_item in mapping:
+                xs, ys = _nan_join(buckets[kind])
+                xy_item.setData(xs, ys)
+                sx, sy = _nan_join(sd_buckets[kind])
+                sd_item.setData(sx, sy)
+                self.layer_point_counts[f"lattice_{kind}"] = int(np.count_nonzero(np.isfinite(xs))) if xs else 0
+            self.layer_point_counts["lattice_xy"] = sum(
+                self.layer_point_counts.get(f"lattice_{k}", 0) for k in buckets
+            )
+
+        def _paint_track(self, stack, plan, gt, s) -> None:
+            segs = _track_segments(getattr(stack, "world", None), plan) if s.p66_show_race_boundary.get() else None
+            xs, ys = _segments_xy(segs)
+            self.xy_track.setData(xs, ys)
+            self._count("track_xy", xs)
+            if gt is None or not xs:
+                self.sd_track.setData([], [])
+                return
+            arr = np.asarray(segs, dtype=float)
+            sd_paths = []
+            for i in range(arr.shape[0]):
+                sd = _to_sd(gt, arr[i, :, :2])
+                if len(sd) < 2:
+                    continue
+                if abs(float(sd[0, 0]) - float(sd[1, 0])) > 80.0:
+                    continue
+                sd_paths.append(sd)
+            sx, sy = _nan_join(sd_paths)
+            self.sd_track.setData(sx, sy)
+
+        def _world_pm(self, stack):
+            world = getattr(stack, "world", None)
+            if world is None:
+                return None
+            try:
+                from avlite.c40_execution.c41_world_bridge import is_world_stack_capability_enabled
+                from avlite.c50_common.c51_capabilities import StackCapability
+
+                if not is_world_stack_capability_enabled(StackCapability.DETECTION):
+                    return None
+            except Exception:
+                return None
+            getter = getattr(world, "get_ground_truth_perception_model", None)
+            if not callable(getter):
+                return None
+            try:
+                return getter()
+            except Exception:
+                return None
+
+        def _paint_ego(self, stack, ego, gt, s) -> None:
+            if not s.p66_show_state.get():
+                self.xy_ego.setData([], [])
+                self.sd_ego.setData([], [])
+                self.xy_heading.setData([], [])
+                for curve in self.xy_agents + self.sd_agents:
+                    curve.setData([], [])
+                return
+            self.xy_ego.setData(*_closed_poly(ego.get_bb_corners()))
+            ctrl = stack.controller
+            front = float(getattr(ctrl, "ego_distance_front_axle", 2.5) or 2.5)
+            length = float(getattr(ego, "length", front + 1.0) or (front + 1.0))
+            rear = max(length - front, 0.0)
+            c, sn = float(np.cos(ego.theta)), float(np.sin(ego.theta))
+            self.xy_heading.setData(
+                [ego.x + front * c, ego.x - rear * c],
+                [ego.y + front * sn, ego.y - rear * sn],
+            )
+            if gt is not None:
+                try:
+                    sd_c = gt.convert_xy_path_to_sd_path_np(ego.get_bb_corners())
+                    if len(sd_c) >= 2 and abs(float(sd_c[0, 0]) - float(sd_c[1, 0])) < 10:
+                        self.sd_ego.setData(*_closed_poly(sd_c))
+                    else:
+                        self.sd_ego.setData([], [])
+                except Exception:
+                    self.sd_ego.setData([], [])
+            agents = _agent_list(self._world_pm(stack) or stack.pm)[:12]
+            for i, curve in enumerate(self.xy_agents):
+                if i < len(agents):
+                    curve.setData(*_closed_poly(agents[i].get_bb_corners()))
+                else:
+                    curve.setData([], [])
+            if gt is None:
+                return
+            for i, curve in enumerate(self.sd_agents):
+                if i < len(agents):
+                    try:
+                        sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
+                        curve.setData(*_closed_poly(sd_c))
+                    except Exception:
+                        curve.setData([], [])
+                else:
+                    curve.setData([], [])
+
+        def _lidar_allowed(self, stack) -> bool:
+            try:
+                from avlite.c40_execution.c41_world_bridge import is_world_capability_enabled
+                from avlite.c50_common.c51_capabilities import WorldCapability
+
+                return is_world_capability_enabled(WorldCapability.LIDAR_2D) or is_world_capability_enabled(
+                    WorldCapability.LIDAR_3D
+                )
+            except Exception:
+                return True
+
+        def _paint_lidar(self, stack, gt, s) -> None:
+            lidar_xy = None
+            if self._lidar_allowed(stack):
+                try:
+                    frame = stack.world.get_sensor_frame()
+                    lidar = getattr(frame, "lidar", None)
+                    pts = getattr(lidar, "points", None) if lidar is not None else None
+                    if pts is not None and len(pts):
+                        arr = np.asarray(pts, dtype=float)
+                        if arr.ndim == 2 and arr.shape[1] >= 2:
+                            lidar_xy = arr[:, :2]
+                except Exception:
+                    lidar_xy = None
+            if lidar_xy is not None and s.p66_show_lidar_global.get():
+                self.xy_lidar.setData(lidar_xy[:, 0], lidar_xy[:, 1])
+                self.layer_point_counts["lidar_xy"] = int(len(lidar_xy))
+            else:
+                self.xy_lidar.setData([], [])
+                self.layer_point_counts["lidar_xy"] = 0
+            if lidar_xy is not None and s.p66_show_lidar_frenet.get() and gt is not None:
+                sd = _to_sd(gt, lidar_xy)
+                self.sd_lidar.setData(sd[:, 0], sd[:, 1]) if len(sd) else self.sd_lidar.setData([], [])
+            else:
+                self.sd_lidar.setData([], [])
+
+        def _paint_clusters(self, stack, gt, s) -> None:
+            xy = _cluster_xy(stack.pm) if s.p66_show_lidar_clusters.get() else None
+            if xy is not None and len(xy):
+                self.xy_clusters.setData(xy[:, 0], xy[:, 1])
+                self.layer_point_counts["clusters_xy"] = int(len(xy))
+                if gt is not None:
+                    sd = _to_sd(gt, xy)
+                    self.sd_clusters.setData(sd[:, 0], sd[:, 1]) if len(sd) else self.sd_clusters.setData([], [])
+                else:
+                    self.sd_clusters.setData([], [])
+            else:
+                self.xy_clusters.setData([], [])
+                self.sd_clusters.setData([], [])
+                self.layer_point_counts["clusters_xy"] = 0
+
+        def _paint_predictions(self, stack, ego, gt, s) -> None:
+            ahead_xy: list[np.ndarray] = []
+            behind_xy: list[np.ndarray] = []
+            ellipses: list[np.ndarray] = []
+            pred = getattr(stack.pm, "prediction", None) if stack.pm is not None else None
+            if s.p67_show_prediction.get() and pred is not None:
+                agents = {getattr(a, "agent_id", i): a for i, a in enumerate(_agent_list(stack.pm))}
+                heading = np.array([np.cos(float(ego.theta)), np.sin(float(ego.theta))])
+                for aid, mode, path, weight in _forecast_modes(pred):
+                    agent = agents.get(aid)
+                    pose = np.array([[float(agent.x), float(agent.y)]]) if agent is not None else path[:1]
+                    full = np.vstack([pose, path]) if len(path) else path
+                    ahead = True
+                    if agent is not None:
+                        to_agent = np.array([float(agent.x) - float(ego.x), float(agent.y) - float(ego.y)])
+                        ahead = float(np.dot(heading, to_agent)) >= 0.0
+                    (ahead_xy if ahead else behind_xy).append(full)
+                    if weight <= 0.0 or len(path) == 0:
+                        continue
+                    step = len(path) - 1
+                    cov = _step_covariance(pred, aid, mode, step)
+                    if cov is None:
+                        continue
+                    poly = _ellipse_polygon(path[step], cov, 0.5)
+                    if poly is not None:
+                        ellipses.append(poly)
+            ax, ay = _nan_join(ahead_xy)
+            bx, by = _nan_join(behind_xy)
+            ex, ey = _nan_join(ellipses)
+            self.xy_pred.setData(ax, ay)
+            self.xy_pred_behind.setData(bx, by)
+            self.xy_ellipses.setData(ex, ey)
+            self._count("prediction_xy", ax + bx)
+            self._count("prediction_ellipses", ex)
+            if gt is not None:
+                self.sd_pred.setData(*_nan_join([_to_sd(gt, p) for p in ahead_xy]))
+                self.sd_pred_behind.setData(*_nan_join([_to_sd(gt, p) for p in behind_xy]))
+                self.sd_ellipses.setData(*_nan_join([_to_sd(gt, p) for p in ellipses]))
+            else:
+                self.sd_pred.setData([], [])
+                self.sd_pred_behind.setData([], [])
+                self.sd_ellipses.setData([], [])
+
+        def _set_image(self, item, grid, origin_x, origin_y, resolution, lut=None) -> None:
+            image = np.asarray(grid, dtype=float)
+            item.setImage(np.ascontiguousarray(image.T), autoLevels=False, levels=(0.0, 1.0))
+            if lut is not None:
+                item.setLookupTable(lut)
+            h, w = image.shape
+            item.setRect(QtCore.QRectF(float(origin_x), float(origin_y), w * resolution, h * resolution))
+            item.show()
+
+        def _paint_occupancy(self, stack, s) -> None:
+            pm = stack.pm
+            show_map = bool(s.p67_show_occupancy_map.get())
+            om = _occupancy_grid(pm) if show_map else None
+            if om is not None:
+                self._set_image(self.xy_occ, om.grid, om.origin_x, om.origin_y, float(om.resolution or 0.25))
+                self.layer_point_counts["occupancy"] = int(np.size(om.grid))
+            else:
+                self.xy_occ.hide()
+                self.layer_point_counts["occupancy"] = 0
+            flow = _flow_image(getattr(pm, "prediction", None)) if s.p67_show_prediction.get() else None
+            if flow is not None:
+                grid, (ox, oy, res) = flow
+                lut = np.zeros((256, 4), dtype=np.ubyte)
+                ramp = np.arange(256, dtype=np.ubyte)
+                lut[:, 0] = ramp
+                lut[:, 1] = (ramp // 3)
+                lut[:, 2] = 255 - ramp
+                lut[:, 3] = np.where(ramp > 8, 160, 0).astype(np.ubyte)
+                self._set_image(self.xy_flow, grid, ox, oy, res, lut)
+                self.layer_point_counts["occupancy_flow"] = int(np.count_nonzero(grid > 0.02))
+            else:
+                self.xy_flow.hide()
+                self.layer_point_counts["occupancy_flow"] = 0
 
         def _hide_ruler(self) -> None:
             self.xy_ruler.setData([], [])

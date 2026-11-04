@@ -68,6 +68,7 @@ class VisualizerQtWindow:
         self.plots_splitter.addWidget(self.global_plot)
         self.plots_splitter.setStretchFactor(0, 1)
         self.plots_splitter.setStretchFactor(1, 1)
+        self.plots_splitter.setMinimumHeight(360)
         root_layout.addWidget(self.plots_splitter, 1)
 
         from .config_bar import ConfigBar
@@ -256,6 +257,9 @@ class VisualizerQtWindow:
         if key == Qt.Key_Escape:
             self.win.setFocus()
             return True
+        extra = self._override_action(self._pressed_sequence(event))
+        if extra and self._run_shortcut(extra):
+            return True
         if text == "Q":
             self.win.close()
             return True
@@ -363,6 +367,148 @@ class VisualizerQtWindow:
             return True
         return False
 
+    def _pressed_sequence(self, event) -> str:
+        Qt = self.QtCore.Qt
+        key = event.key()
+        text = event.text()
+        ctrl = bool(event.modifiers() & Qt.ControlModifier)
+        special = {
+            Qt.Key_Up: "Up",
+            Qt.Key_Down: "Down",
+            Qt.Key_Escape: "Esc",
+            Qt.Key_Plus: "+",
+            Qt.Key_Equal: "+",
+            Qt.Key_Minus: "-",
+        }
+        if ctrl:
+            name = special.get(key)
+            if name is None and Qt.Key_A <= key <= Qt.Key_Z:
+                name = chr(key)
+            return ("Ctrl+" + name) if name else ""
+        if text and text.isprintable():
+            return text
+        return special.get(key, "")
+
+    def _override_action(self, sequence: str) -> str:
+        if not sequence:
+            return ""
+        from .settings import PluginSettings
+        from .shortcuts import SHORTCUTS
+
+        overrides = dict(getattr(PluginSettings, "p60_shortcuts", {}) or {})
+        for shortcut in SHORTCUTS:
+            bound = str(overrides.get(shortcut.id, "") or "")
+            if bound and bound != shortcut.default and bound == sequence:
+                return shortcut.id
+        return ""
+
+    def _run_shortcut(self, action: str) -> bool:
+        if action == "quit":
+            self.win.close()
+            return True
+        if action == "toggle_shortcuts":
+            self.setting.p60_shortcut_mode.set(not self.setting.p60_shortcut_mode.get())
+            self.update_shortcut_mode()
+            return True
+        if action == "switch_profile":
+            self.switch_profile()
+            return True
+        if action == "reload":
+            self.reload_stack(reload_code=True)
+            return True
+        if action == "open_settings":
+            self.config_bar.open_settings()
+            return True
+        if action == "save_settings":
+            self.config_bar.save_settings()
+            return True
+        if action == "focus":
+            self.win.setFocus()
+            return True
+        if action == "replan":
+            self.stack_panels.planning._local_replan()
+            return True
+        if action == "step_plan" and self.exec and self.exec.local_planner:
+            gt = self.exec.local_planner.global_trajectory
+            if hasattr(gt, "step_wp"):
+                gt.step_wp(1)
+            self.update_ui()
+            return True
+        if action == "step_plan_back" and self.exec and self.exec.local_planner:
+            gt = self.exec.local_planner.global_trajectory
+            if hasattr(gt, "step_wp"):
+                gt.step_wp(-1)
+            self.update_ui()
+            return True
+        if action == "zoom_in":
+            self.setting.p66_xy_zoom = max(5.0, float(self.setting.p66_xy_zoom) - 5.0)
+            self.update_ui()
+            return True
+        if action == "zoom_out":
+            self.setting.p66_xy_zoom = min(500.0, float(self.setting.p66_xy_zoom) + 5.0)
+            self.update_ui()
+            return True
+        if action == "zoom_in_frenet":
+            self.setting.p66_frenet_zoom = max(5.0, float(self.setting.p66_frenet_zoom) - 5.0)
+            self.update_ui()
+            return True
+        if action == "zoom_out_frenet":
+            self.setting.p66_frenet_zoom = min(500.0, float(self.setting.p66_frenet_zoom) + 5.0)
+            self.update_ui()
+            return True
+        if action == "toggle_exec":
+            self.stack_panels.execution.toggle_exec()
+            return True
+        if action == "step_exec":
+            self.stack_panels.execution.step_exec()
+            return True
+        if action == "reset_exec":
+            self.stack_panels.execution.reset_exec()
+            return True
+        if action == "clear_log":
+            self.log_panel.clear()
+            return True
+        if action == "toggle_log_height":
+            self.log_panel.toggle_height()
+            return True
+        if action == "log_up":
+            self.log_panel.scroll_lines(-1)
+            return True
+        if action == "log_down":
+            self.log_panel.scroll_lines(1)
+            return True
+        if action == "log_top":
+            self.log_panel.scroll_top()
+            return True
+        if action == "log_bottom":
+            self.log_panel.scroll_bottom()
+            return True
+        if action == "log_page_up":
+            self.log_panel.scroll_half_page(-1)
+            return True
+        if action == "log_page_down":
+            self.log_panel.scroll_half_page(1)
+            return True
+        if action == "accelerate" and not self._drive_blocked("w"):
+            self.stack_panels.control._drive(3, 0)
+            return True
+        if action == "decelerate" and not self._drive_blocked("s"):
+            self.stack_panels.control._drive(-3, 0)
+            return True
+        if action == "steer_left" and not self._drive_blocked("a"):
+            self.stack_panels.control._drive(0, 0.7)
+            return True
+        if action == "steer_right" and not self._drive_blocked("d"):
+            self.stack_panels.control._drive(0, -0.7)
+            return True
+        if action == "step_control":
+            self.stack_panels.control._step()
+            return True
+        if action == "align_control":
+            self.stack_panels.control._align()
+            return True
+        return False
+
     def _on_key_release(self, event) -> bool:
         text = event.text()
         if text in ("a", "d") and not self._typing_focus() and not self._drive_blocked(text):
@@ -402,6 +548,8 @@ class VisualizerQtWindow:
         self.global_plot.setVisible(show_g)
         self.local_plot.setVisible(show_l)
         self.local_plot.update_visibility()
+        hide_menu = bool(getattr(self.setting.schema, "p60_hide_menubar", False))
+        self.win.menuBar().setVisible(not hide_menu)
         if hasattr(self, "config_bar"):
             self.config_bar.sync_from_settings()
         self.update_shortcut_mode()
@@ -527,6 +675,7 @@ class VisualizerQtWindow:
             self.setting.p66_xy_zoom = float(PluginSettings.p66_xy_zoom)
             self.setting.p66_frenet_zoom = float(PluginSettings.p66_frenet_zoom)
             self.setting.p66_global_zoom = float(PluginSettings.p66_global_zoom)
+            self.setting.pull_plugin_schema()
         load_stack_settings(profile=profile)
         self._pin_self_as_community_plugin()
         self.setting.sync_stack_from_singletons()

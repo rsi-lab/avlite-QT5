@@ -273,6 +273,17 @@ class VisualizationSettings:
     def local_plan_view_enabled(self) -> bool:
         return bool(self.p67_show_local_global_view.get() or self.p67_show_local_frenet_view.get())
 
+    def pull_plugin_schema(self) -> None:
+        """Copy persisted plugin fields onto the live Vars and zoom numbers."""
+        schema = self.schema
+        for name in getattr(type(schema), "model_fields", {}):
+            value = getattr(schema, name)
+            current = getattr(self, name, None)
+            if isinstance(current, Var):
+                current.set(value)
+            elif current is not None and not callable(current):
+                setattr(self, name, value)
+
     def push_plugin_schema(self) -> None:
         """Copy toolbar/plot values onto the persisted plugin schema."""
         schema = self.schema

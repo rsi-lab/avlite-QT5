@@ -96,6 +96,40 @@ def _check(parent, text: str, var: Var, on_change: Callable[[], None] | None = N
     return box
 
 
+def _info_button(parent, combo, registry, *, bridge: bool = False):
+    """ⓘ button that opens the Tk-style capability contract popup."""
+    from .qt_binding import import_qt
+
+    _QtCore, _QtGui, QtWidgets = import_qt()
+    btn = QtWidgets.QPushButton("ⓘ")
+    btn.setFixedWidth(28)
+    btn.setObjectName("contractInfo")
+    btn.setToolTip("World requirements, stack requirements and capabilities")
+
+    def _show() -> None:
+        from .contracts import show_contract_dialog
+
+        name = combo.currentText()
+        cls = (registry or {}).get(name)
+        executer = parent.root.exec
+        target = cls
+        if executer is not None and cls is not None:
+            live_attrs = ("world",) if bridge else (
+                "perception", "localization", "mapping", "global_planner", "local_planner", "controller",
+            )
+            for attr in live_attrs:
+                live = getattr(executer, attr, None)
+                if live is not None and type(live).__name__ == getattr(cls, "__name__", ""):
+                    target = live
+                    break
+        show_contract_dialog(
+            parent, title=name or "(none)", target=target, executer=executer, bridge=bridge,
+        )
+
+    btn.clicked.connect(_show)
+    return btn
+
+
 def _dbl_spin(parent, var: Var, lo=0.001, hi=10.0, step=0.01) -> QtWidgets.QDoubleSpinBox:
     spin = QtWidgets.QDoubleSpinBox(parent)
     spin.setRange(lo, hi)
@@ -161,6 +195,9 @@ def _install_panels() -> None:
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
             grid.addWidget(self.perc, 0, 1)
+            from avlite.c10_perception.c12_perception_strategy import PerceptionStrategy
+
+            grid.addWidget(_info_button(self, self.perc, PerceptionStrategy.registry), 0, 2)
             grid.addWidget(QtWidgets.QLabel("Detect"), 1, 0)
             self.det = _combo(self, root.setting.detection_strategy_type, choices["detection"], root.refresh_pipeline)
             grid.addWidget(self.det, 1, 1)
@@ -224,6 +261,9 @@ def _install_panels() -> None:
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
             grid.addWidget(self.gplan, 0, 1)
+            from avlite.c20_planning.c22_global_planning_strategy import GlobalPlannerStrategy
+
+            grid.addWidget(_info_button(self, self.gplan, GlobalPlannerStrategy.registry), 0, 3)
             btn_greplan = QtWidgets.QPushButton("Global Replan")
             btn_greplan.clicked.connect(root.replan_global)
             grid.addWidget(btn_greplan, 0, 2)
@@ -310,6 +350,31 @@ def _install_panels() -> None:
                 w.setEnabled(pipe)
 
 
+    class ValueGauge(QtWidgets.QWidget):
+        """Horizontal meter matching the Tk ValueGauge (value inside min/max)."""
+
+        def __init__(self, lo: float, hi: float, parent=None):
+            super().__init__(parent)
+            self._lo = float(lo)
+            self._hi = float(hi)
+            self._value = 0.0
+            self.setFixedHeight(10)
+            self.setMinimumWidth(48)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        def setValue(self, value: float) -> None:
+            self._value = float(value)
+            self.update()
+
+        def paintEvent(self, _event) -> None:  # noqa: N802
+            painter = QtGui.QPainter(self)
+            painter.fillRect(self.rect(), QtGui.QColor("#2b2b2b"))
+            span = self._hi - self._lo
+            if span == 0:
+                return
+            frac = max(0.0, min(1.0, (self._value - self._lo) / span))
+            painter.fillRect(0, 0, int(self.width() * frac), self.height(), QtGui.QColor("#6abf69"))
+
     class ControlPanel(QtWidgets.QGroupBox):
         def __init__(self, root: "VisualizerQtWindow"):
             super().__init__("Control")
@@ -322,6 +387,9 @@ def _install_panels() -> None:
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
             grid.addWidget(self.ctrl, 0, 1, 1, 2)
+            from avlite.c30_control.c32_control_strategy import ControlStrategy
+
+            grid.addWidget(_info_button(self, self.ctrl, ControlStrategy.registry), 0, 3)
             self.gauges = {
                 "vel_cte": QtWidgets.QLabel("Vel CTE:    +0.00"),
                 "pos_cte": QtWidgets.QLabel("Pos CTE:    +0.00"),
@@ -351,6 +419,24 @@ def _install_panels() -> None:
                 b.clicked.connect(slot)
                 btn_row.addWidget(b)
             grid.addLayout(btn_row, 3, 0, 1, 3)
+            self.value_gauges = {}
+            from avlite.c30_control.c39_settings import ControlSettings
+
+            amin = float(getattr(ControlSettings, "c32_ego_min_acceleration", -20.0))
+            smax = float(getattr(ControlSettings, "c32_ego_max_steering", 0.7))
+            ranges = {
+                "vel_cte": (-10.0, 10.0),
+                "pos_cte": (-5.0, 5.0),
+                "accel": (amin, abs(amin)),
+                "steer": (-smax, smax),
+            }
+            for key, (row, col) in (
+                ("vel_cte", (4, 0)), ("pos_cte", (4, 1)), ("accel", (5, 0)), ("steer", (5, 1)),
+            ):
+                bar = ValueGauge(*ranges[key])
+                bar.setObjectName(f"valueGauge_{key}")
+                self.value_gauges[key] = bar
+                grid.addWidget(bar, row, col)
             root.setting.cte_vel.bind(self._update_gauges)
             root.setting.cte_steer.bind(self._update_gauges)
             root.setting.cmd_accel.bind(self._update_gauges)
@@ -362,6 +448,11 @@ def _install_panels() -> None:
             self.gauges["pos_cte"].setText(f"Pos CTE: {float(s.cte_steer.get()):+9.2f}")
             self.gauges["accel"].setText(f"Accel:   {float(s.cmd_accel.get()):+9.2f}")
             self.gauges["steer"].setText(f"Steer:   {float(s.cmd_steer.get()):+9.2f}")
+            if hasattr(self, "value_gauges"):
+                self.value_gauges["vel_cte"].setValue(float(s.cte_vel.get()))
+                self.value_gauges["pos_cte"].setValue(float(s.cte_steer.get()))
+                self.value_gauges["accel"].setValue(float(s.cmd_accel.get()))
+                self.value_gauges["steer"].setValue(float(s.cmd_steer.get()))
 
         def _drive(self, accel: float, steer: float) -> None:
             if self.root.exec is None:
@@ -411,6 +502,9 @@ def _install_panels() -> None:
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
             top.addWidget(self.bridge)
+            from avlite.c40_execution.c41_world_bridge import WorldBridge
+
+            top.addWidget(_info_button(self, self.bridge, WorldBridge.registry, bridge=True))
             top.addWidget(_check(self, "Perception", root.setting.exec_perceive))
             top.addWidget(_check(self, "Planning", root.setting.exec_plan))
             top.addWidget(_check(self, "Control", root.setting.exec_control))
@@ -464,6 +558,59 @@ def _install_panels() -> None:
             self.cap_label.setObjectName("capLabel")
             pin_fluid_readout(self.cap_label)
             v.addWidget(self.cap_label)
+            self.cap_box = QtWidgets.QWidget()
+            self.cap_box.setObjectName("capabilityPanel")
+            self.cap_box.setMaximumHeight(36)
+            cap_row = QtWidgets.QHBoxLayout(self.cap_box)
+            cap_row.setContentsMargins(0, 0, 0, 0)
+            self.world_cap_host = QtWidgets.QWidget()
+            self.world_cap_host.setObjectName("worldCapabilities")
+            self.world_cap_layout = QtWidgets.QHBoxLayout(self.world_cap_host)
+            self.world_cap_layout.setContentsMargins(0, 0, 0, 0)
+            self.stack_cap_host = QtWidgets.QWidget()
+            self.stack_cap_host.setObjectName("stackCapabilities")
+            self.stack_cap_layout = QtWidgets.QHBoxLayout(self.stack_cap_host)
+            self.stack_cap_layout.setContentsMargins(0, 0, 0, 0)
+            cap_row.addWidget(self.world_cap_host, 1)
+            cap_row.addWidget(self.stack_cap_host, 1)
+            v.addWidget(self.cap_box)
+            self._cap_key = None
+            self._world_checks = []
+            self._stack_checks = []
+
+            files = QtWidgets.QHBoxLayout()
+            files.addWidget(QtWidgets.QLabel("Map"))
+            self.map_edit = QtWidgets.QLineEdit(str(root.setting.default_map_file.get() or ""))
+            self.map_edit.setObjectName("mapFile")
+            self.map_edit.editingFinished.connect(
+                lambda: root.setting.default_map_file.set(self.map_edit.text())
+            )
+            files.addWidget(self.map_edit, 1)
+            map_btn = QtWidgets.QPushButton("…")
+            map_btn.setFixedWidth(28)
+            map_btn.clicked.connect(lambda: self._pick_file(self.map_edit, root.setting.default_map_file))
+            files.addWidget(map_btn)
+            files.addWidget(QtWidgets.QLabel("Plan"))
+            self.plan_edit = QtWidgets.QLineEdit(str(root.setting.default_global_plan_file.get() or ""))
+            self.plan_edit.setObjectName("planFile")
+            self.plan_edit.editingFinished.connect(
+                lambda: root.setting.default_global_plan_file.set(self.plan_edit.text())
+            )
+            files.addWidget(self.plan_edit, 1)
+            plan_btn = QtWidgets.QPushButton("…")
+            plan_btn.setFixedWidth(28)
+            plan_btn.clicked.connect(
+                lambda: self._pick_file(self.plan_edit, root.setting.default_global_plan_file)
+            )
+            files.addWidget(plan_btn)
+            v.addLayout(files)
+
+            self.task_host = QtWidgets.QWidget()
+            self.task_host.setObjectName("taskChips")
+            self.task_host.setMaximumHeight(32)
+            self.task_row = QtWidgets.QHBoxLayout(self.task_host)
+            self.task_row.setContentsMargins(0, 0, 0, 0)
+            v.addWidget(self.task_host)
 
             stats = QtWidgets.QHBoxLayout()
             self.stats_lbl = QtWidgets.QLabel("real=    0.00  sim=    0.00  perc=    0.0  plan=    0.0  ctrl=    0.0  ui=    0.0 Hz  plot=    0.0 ms")
@@ -485,6 +632,31 @@ def _install_panels() -> None:
                 f"perc={s.perception_fps.get()}  plan={s.replan_fps.get()}  ctrl={s.control_fps.get()}  "
                 f"ui={s.ui_fps.get()} Hz  plot={s.plot_latency_ms.get()} ms"
             )
+
+        def _pick_file(self, edit, var) -> None:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select file", edit.text())
+            if not path:
+                return
+            edit.setText(path)
+            var.set(path)
+
+        def _rebuild_task_chips(self) -> None:
+            while self.task_row.count():
+                item = self.task_row.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            for name in self.root.setting.execution_task_names():
+                chip = QtWidgets.QPushButton(name)
+                chip.setObjectName(f"taskChip_{name}")
+                chip.clicked.connect(lambda _checked=False, n=name: self._remove_task(n))
+                self.task_row.addWidget(chip)
+            self.task_row.addStretch(1)
+
+        def _remove_task(self, name: str) -> None:
+            names = [n for n in self.root.setting.execution_task_names() if n != name]
+            self.root.setting.execution_tasks.set(",".join(names))
+            self.root.reload_stack(reload_code=False)
 
         def _add_task(self) -> None:
             selected = set(self.root.setting.execution_task_names())
@@ -577,15 +749,80 @@ def _install_panels() -> None:
                 box.setCurrentIndex(idx if idx >= 0 else 0)
                 box.blockSignals(False)
             self._refresh_caps()
+            self._rebuild_task_chips()
+
+        def _clear_layout(self, layout) -> None:
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
 
         def _refresh_caps(self) -> None:
+            from avlite.c40_execution.c41_world_bridge import (
+                is_world_capability_enabled,
+                is_world_stack_capability_enabled,
+            )
+            from avlite.c40_execution.c49_settings import ExecutionSettings
+
             world = getattr(self.root.exec, "world", None) if self.root.exec else None
             if world is None:
                 self.cap_label.setText("caps: —")
                 return
-            sensors = ", ".join(sorted(c.name for c in getattr(world, "world_capabilities", ()) or ()))
-            gt = ", ".join(sorted(c.name for c in getattr(world, "stack_capabilities", ()) or ()))
-            self.cap_label.setText(f"world: {sensors or '—'} | stack: {gt or '—'}")
+            skip = {"AGENT_SPAWN", "AGENT_CONTROL", "AGENT_SENSING"}
+            sensors = [c for c in (getattr(world, "world_capabilities", ()) or ()) if c.name not in skip]
+            gt = list(getattr(world, "stack_capabilities", ()) or ())
+            self.cap_label.setText(
+                "world: "
+                + (", ".join(c.name for c in sensors) or "—")
+                + " | stack: "
+                + (", ".join(c.name for c in gt) or "—")
+            )
+            key = (tuple(c.name for c in sensors), tuple(c.name for c in gt))
+            if key == self._cap_key:
+                for box in self._world_checks:
+                    box.blockSignals(True)
+                    box.setChecked(is_world_capability_enabled(box.property("cap_obj")))
+                    box.blockSignals(False)
+                for box in self._stack_checks:
+                    box.blockSignals(True)
+                    box.setChecked(is_world_stack_capability_enabled(box.property("cap_obj")))
+                    box.blockSignals(False)
+                return
+            self._cap_key = key
+            self._clear_layout(self.world_cap_layout)
+            self._clear_layout(self.stack_cap_layout)
+            self._world_checks = []
+            self._stack_checks = []
+            self.world_cap_layout.addWidget(QtWidgets.QLabel("World"))
+            for cap in sensors:
+                box = QtWidgets.QCheckBox(cap.name)
+                box.setObjectName(f"worldCap_{cap.name}")
+                box.setProperty("cap_obj", cap)
+                box.setChecked(is_world_capability_enabled(cap))
+                box.stateChanged.connect(lambda _state: self._write_caps())
+                self.world_cap_layout.addWidget(box)
+                self._world_checks.append(box)
+            self.stack_cap_layout.addWidget(QtWidgets.QLabel("GT"))
+            for cap in gt:
+                box = QtWidgets.QCheckBox(cap.name)
+                box.setObjectName(f"stackCap_{cap.name}")
+                box.setProperty("cap_obj", cap)
+                box.setChecked(is_world_stack_capability_enabled(cap))
+                box.stateChanged.connect(lambda _state: self._write_caps())
+                self.stack_cap_layout.addWidget(box)
+                self._stack_checks.append(box)
+
+        def _write_caps(self) -> None:
+            from avlite.c40_execution.c49_settings import ExecutionSettings
+
+            ExecutionSettings.c41_world_capabilities = [
+                box.property("cap_obj").name for box in self._world_checks if box.isChecked()
+            ]
+            ExecutionSettings.c41_world_stack_capabilities = [
+                box.property("cap_obj").name for box in self._stack_checks if box.isChecked()
+            ]
+            self.root.update_ui()
 
 
 def __getattr__(name: str):
