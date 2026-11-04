@@ -19,7 +19,7 @@ git clone https://github.com/rsi-lab/avlite-QT5.git \
   ~/.local/share/avlite/plugins/avlite-QT5
 ```
 
-Register it the same way as other community plugins (Plugins browser **Register**, or the profile snippet below). AVLite imports the directory as `avlite.plugins.avlite_QT5` via `CommunityPluginFinder`.
+Register it the same way as other community plugins (Plugins browser **Register**, or the profile snippet below). AVLite imports the directory as `avlite.plugins.avlite_QT5` via `CommunityPluginFinder`. That import does not load PyQt, so the built-in Tk visualizer can finish starting while this plugin is registered. PyQt is imported only when the Qt window is created.
 
 ```yaml
 c69_apps:
@@ -28,6 +28,16 @@ c69_apps:
 ```
 
 This repository ships [avlite-QT5.yaml](avlite-QT5.yaml). On Install/Update, AVLite can import that file as a profile named `avlite-QT5`.
+
+## Tk visualizer while this plugin is installed
+
+`avlite` builds its Matplotlib figures with `plt.subplots` before it imports community plugins. Once PyQt5 is installed, Matplotlib's automatic backend is `qtagg`, so that call opens a Qt application during the Tk loading screen. Pin the Tk backend in the environment before Python starts:
+
+```bash
+MPLBACKEND=TkAgg avlite
+```
+
+This repository cannot set that itself. Registered plugins are imported later, from `reload_stack`.
 
 ## Launch
 

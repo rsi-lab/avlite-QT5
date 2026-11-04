@@ -16,12 +16,8 @@ from avlite.c60_apps.c65_setting_utils import list_profiles, load_setting
 from avlite.c60_apps.c68_paths import ConfigPaths
 from avlite.c60_apps.c69_settings import AppSettings
 
-from .log_panel import LogPanel
-from .plot_widgets import GlobalPlotWidget, LocalPlotWidget
-from .qt_binding import configure_qt_env, import_pyqtgraph, import_qt
 from .setting_model import VisualizationSettings
 from .shortcuts import SHORTCUTS
-from .stack_panels import StackPanels
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +34,8 @@ class VisualizerQtWindow:
     hosting_plugin_name = "avlite-QT5"
 
     def __init__(self):
+        from .qt_binding import configure_qt_env, import_pyqtgraph, import_qt
+
         configure_qt_env()
         QtCore, QtGui, QtWidgets = import_qt()
         self.QtCore = QtCore
@@ -61,6 +59,8 @@ class VisualizerQtWindow:
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.setSpacing(4)
 
+        from .plot_widgets import GlobalPlotWidget, LocalPlotWidget
+
         self.plots_splitter = QtWidgets.QSplitter()
         self.local_plot = LocalPlotWidget(self)
         self.global_plot = GlobalPlotWidget(self)
@@ -78,8 +78,12 @@ class VisualizerQtWindow:
         )
         root_layout.addWidget(self.shortcut_help)
 
+        from .stack_panels import StackPanels
+
         self.stack_panels = StackPanels(self)
         root_layout.addWidget(self.stack_panels)
+
+        from .log_panel import LogPanel
 
         self.log_panel = LogPanel(self)
         root_layout.addWidget(self.log_panel, 0)
@@ -624,6 +628,8 @@ class VisualizerQtWindow:
 
 def launch(*, offscreen: bool = False) -> int:
     """Create the visualizer and run the Qt event loop."""
+    from .qt_binding import configure_qt_env
+
     configure_qt_env(offscreen=offscreen)
     window = VisualizerQtWindow()
     return window.exec_app()
