@@ -1,8 +1,7 @@
-"""High-performance pyqtgraph plot widgets (no Matplotlib).
+"""pyqtgraph plot widgets (no Matplotlib).
 
-Each frame updates PlotDataItem/ScatterPlotItem via ``setData`` — O(n) GPU/CPU
-path instead of rebuilding a Matplotlib figure. Suitable for 60+ FPS UI refresh
-while AsyncThreadedExecuter / SyncExecuter.step runs off or between UI ticks.
+Dynamic marks use ``setData``. Track, boundaries, and the global plan are
+cached and clipped to the view. The window timer caps plot redraws at 30 Hz.
 """
 
 from __future__ import annotations
@@ -48,18 +47,26 @@ def _agent_list(pm) -> list:
     return list(getattr(pm, "agents", []) or [])
 
 
-def _nan_join(paths: list[np.ndarray]) -> tuple[list[float], list[float]]:
-    xs: list[float] = []
-    ys: list[float] = []
+def _nan_join(paths: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Join polylines with a NaN break. Returns arrays so ``setData`` skips a Python copy."""
+    chunks_x: list[np.ndarray] = []
+    chunks_y: list[np.ndarray] = []
     for path in paths:
         arr = np.asarray(path, dtype=float)
         if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
             continue
-        xs.extend(arr[:, 0].tolist())
-        xs.append(np.nan)
-        ys.extend(arr[:, 1].tolist())
-        ys.append(np.nan)
-    return xs, ys
+        n = int(arr.shape[0])
+        xs = np.empty(n + 1, dtype=float)
+        ys = np.empty(n + 1, dtype=float)
+        xs[:n] = arr[:, 0]
+        ys[:n] = arr[:, 1]
+        xs[n] = np.nan
+        ys[n] = np.nan
+        chunks_x.append(xs)
+        chunks_y.append(ys)
+    if not chunks_x:
+        return np.array([]), np.array([])
+    return np.concatenate(chunks_x), np.concatenate(chunks_y)
 
 
 def _to_sd(gt, xy: np.ndarray) -> np.ndarray:
@@ -74,12 +81,20 @@ def _to_sd(gt, xy: np.ndarray) -> np.ndarray:
     return sd[:, :2]
 
 
-def _segments_xy(segs) -> tuple[list[float], list[float]]:
+def _segments_xy(segs) -> tuple[np.ndarray, np.ndarray]:
     arr = np.asarray(segs, dtype=float) if segs is not None else np.zeros((0, 2, 2))
-    if arr.ndim != 3 or arr.shape[-1] < 2 or arr.shape[-2] < 2:
-        return [], []
-    paths = [arr[i, :, :2] for i in range(arr.shape[0])]
-    return _nan_join(paths)
+    if arr.ndim != 3 or arr.shape[0] == 0 or arr.shape[-1] < 2 or arr.shape[-2] < 2:
+        return np.array([]), np.array([])
+    count = int(arr.shape[0])
+    xs = np.empty(count * 3, dtype=float)
+    ys = np.empty(count * 3, dtype=float)
+    xs[0::3] = arr[:, 0, 0]
+    xs[1::3] = arr[:, 1, 0]
+    xs[2::3] = np.nan
+    ys[0::3] = arr[:, 0, 1]
+    ys[1::3] = arr[:, 1, 1]
+    ys[2::3] = np.nan
+    return xs, ys
 
 
 def _track_segments(world, plan):
@@ -311,16 +326,185 @@ def _velocity_colors(speed: np.ndarray, scale: str) -> list[tuple[int, int, int,
         else:
             lo, hi = float(np.min(finite)), float(np.max(finite))
             t = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
-    colors = []
-    for u in t:
-        if not np.isfinite(u):
-            colors.append((80, 80, 80, 0))
+    u = np.asarray(t, dtype=float)
+    r = (40 + 215 * u).astype(np.int32)
+    g = (80 + 140 * (1.0 - np.abs(u - 0.5) * 2.0)).astype(np.int32)
+    b = (220 * (1.0 - u)).astype(np.int32)
+    colors = np.column_stack([r, g, b, np.full(u.shape, 230, dtype=np.int32)])
+    colors[~np.isfinite(u)] = (80, 80, 80, 0)
+    return [tuple(int(c) for c in row) for row in colors]
+
+
+def _paths_token(paths) -> tuple:
+    if not paths:
+        return (0,)
+    count = 0
+    acc = 0.0
+    for path in paths:
+        arr = np.asarray(path, dtype=float)
+        if arr.size == 0:
             continue
-        r = int(40 + 215 * u)
-        g = int(80 + 140 * (1.0 - abs(u - 0.5) * 2.0))
-        b = int(220 * (1.0 - u))
-        colors.append((r, g, b, 230))
-    return colors
+        count += int(arr.shape[0]) if arr.ndim == 2 else int(arr.size)
+        flat = arr.reshape(-1)
+        acc += float(flat[0]) + float(flat[flat.size // 2]) + float(flat[-1])
+    return (len(paths), count, round(acc, 3))
+
+
+def _plan_arrays(plan) -> dict:
+    """Copy plan polylines once. Callers cache the result by plan identity."""
+    traj = getattr(plan, "trajectory", None)
+
+    def xy(xs, ys):
+        return _safe_xy(xs, ys)
+
+    lbx, lby = xy(getattr(plan, "left_boundary_x", None), getattr(plan, "left_boundary_y", None))
+    rbx, rby = xy(getattr(plan, "right_boundary_x", None), getattr(plan, "right_boundary_y", None))
+    if traj is not None:
+        refx, refy = xy(getattr(traj, "path_x", None), getattr(traj, "path_y", None))
+        refs = np.asarray(getattr(traj, "path_s", []) or [], dtype=float).ravel()
+        vel = np.asarray(getattr(traj, "velocity", []) or [], dtype=float).ravel()
+    else:
+        refx = refy = refs = vel = np.array([])
+    left_d = getattr(plan, "left_boundary_d", None)
+    right_d = getattr(plan, "right_boundary_d", None)
+    n = min(int(refs.size), len(left_d) if left_d is not None else 0, len(right_d) if right_d is not None else 0)
+    if n:
+        sd_s = refs[:n]
+        sd_l = np.asarray(left_d[:n], dtype=float)
+        sd_r = np.asarray(right_d[:n], dtype=float)
+    else:
+        sd_s = sd_l = sd_r = np.array([])
+    bounds = None
+    if lbx.size and rbx.size:
+        bounds = (
+            float(min(lbx.min(), rbx.min())),
+            float(max(lbx.max(), rbx.max())),
+            float(min(lby.min(), rby.min())),
+            float(max(lby.max(), rby.max())),
+        )
+    elif refx.size:
+        bounds = (float(refx.min()), float(refx.max()), float(refy.min()), float(refy.max()))
+    return {
+        "lbx": lbx, "lby": lby, "rbx": rbx, "rby": rby,
+        "refx": refx, "refy": refy, "refs": refs, "vel": vel,
+        "sd_s": sd_s, "sd_l": sd_l, "sd_r": sd_r,
+        "bounds": bounds, "traj": traj,
+    }
+
+
+def _window_token(window, quantum: float = 1.0):
+    """Quantize a view window so a moving ego does not reupload static geometry every tick."""
+    if window is None:
+        return None
+    q = float(quantum)
+    return tuple(int(round(float(v) / q)) for v in window)
+
+
+def _decimate_polyline(x: np.ndarray, y: np.ndarray, window, margin_frac: float = 0.15):
+    """Keep the vertices near ``window``, with NaN breaks between disjoint runs."""
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    n = min(int(x.size), int(y.size))
+    x, y = x[:n], y[:n]
+    if window is None or n == 0:
+        return x, y
+    x0, x1, y0, y1 = window
+    mx = (x1 - x0) * margin_frac
+    my = (y1 - y0) * margin_frac
+    inside = (x >= x0 - mx) & (x <= x1 + mx) & (y >= y0 - my) & (y <= y1 + my)
+    if not inside.any():
+        return x[:0], y[:0]
+    idx = np.flatnonzero(inside)
+    runs = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+    xs_parts: list[np.ndarray] = []
+    ys_parts: list[np.ndarray] = []
+    nan = np.array([np.nan])
+    for k, run in enumerate(runs):
+        a = max(int(run[0]) - 1, 0)
+        b = min(int(run[-1]) + 2, n)
+        if k:
+            xs_parts.append(nan)
+            ys_parts.append(nan)
+        xs_parts.append(x[a:b])
+        ys_parts.append(y[a:b])
+    return np.concatenate(xs_parts), np.concatenate(ys_parts)
+
+
+def _clip_segments(segs, window, margin_frac: float = 0.15) -> np.ndarray:
+    arr = np.asarray(segs, dtype=float)
+    if arr.ndim != 3 or arr.shape[0] == 0:
+        return np.zeros((0, 2, 2))
+    if window is None:
+        return arr
+    x0, x1, y0, y1 = window
+    mid = arr.mean(axis=1)
+    mx = (x1 - x0) * margin_frac
+    my = (y1 - y0) * margin_frac
+    mask = (
+        (mid[:, 0] >= x0 - mx) & (mid[:, 0] <= x1 + mx)
+        & (mid[:, 1] >= y0 - my) & (mid[:, 1] <= y1 + my)
+    )
+    return arr[mask]
+
+
+def _push_hidden(cache: dict, item, key: str) -> None:
+    if cache.get(key) == ("off",):
+        return
+    cache[key] = ("off",)
+    item.setData([], [])
+
+
+def _push_windowed(cache: dict, item, key: str, x, y, window, quantum: float = 1.0) -> None:
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    n = min(int(x.size), int(y.size))
+    x, y = x[:n], y[:n]
+    if n == 0:
+        src = (0,)
+    else:
+        src = (n, round(float(x[0]), 3), round(float(y[0]), 3), round(float(x[-1]), 3), round(float(y[-1]), 3))
+    token = (src, _window_token(window, quantum))
+    if cache.get(key) == token:
+        return
+    cache[key] = token
+    xs, ys = _decimate_polyline(x, y, window)
+    item.setData(xs, ys)
+
+
+def _series_token(x: np.ndarray, y: np.ndarray, extra=()):
+    n = min(int(x.size), int(y.size))
+    if n == 0:
+        return (0, extra)
+    finite = np.flatnonzero(np.isfinite(x[:n]) & np.isfinite(y[:n]))
+    if finite.size == 0:
+        return (0, extra)
+    i0 = int(finite[0])
+    i1 = int(finite[finite.size // 2])
+    i2 = int(finite[-1])
+    step = max(1, int(finite.size) // 8)
+    sample = finite[::step]
+    return (
+        n,
+        round(float(x[i0]), 3), round(float(y[i0]), 3),
+        round(float(x[i1]), 3), round(float(y[i1]), 3),
+        round(float(x[i2]), 3), round(float(y[i2]), 3),
+        round(float(np.sum(x[sample])), 2),
+        round(float(np.sum(y[sample])), 2),
+        extra,
+    )
+
+
+def _set_curve(cache: dict, item, key: str, x, y, extra=()) -> bool:
+    xa = np.asarray(x, dtype=float).ravel()
+    ya = np.asarray(y, dtype=float).ravel()
+    n = min(int(xa.size), int(ya.size))
+    xa, ya = xa[:n], ya[:n]
+    token = _series_token(xa, ya, extra)
+    if cache.get(key) == token:
+        return False
+    cache[key] = token
+    item.setData(xa, ya)
+    return True
 
 
 def _pin_plot_chrome(plot) -> None:
@@ -332,6 +516,8 @@ def _pin_plot_chrome(plot) -> None:
     the PlotWidget size hint. The hint feeds the window minimum, so the whole
     window jumps when coordinates gain a digit. A fixed axis size breaks the loop.
     """
+    if hasattr(plot, "setAntialiasing"):
+        plot.setAntialiasing(False)
     if getattr(plot, "_avlite_chrome_pinned", False):
         return
     plot.hideButtons()
@@ -349,12 +535,7 @@ def _pin_plot_chrome(plot) -> None:
         plot._avlite_chrome_pinned = True
 
 
-def _set_equal_view(plot, cx: float, cy: float, half_x: float) -> None:
-    """Pan to ``(cx, cy)`` at a constant scale. No auto-range.
-
-    The pixel aspect is cached for the current widget size so a 1px axis
-    tweak cannot change the zoom. Following the ego still updates the center.
-    """
+def _plot_aspect(plot) -> float:
     _pin_plot_chrome(plot)
     vb = plot.getViewBox()
     widget_wh = (int(plot.width()), int(plot.height()))
@@ -368,16 +549,31 @@ def _set_equal_view(plot, cx: float, cy: float, half_x: float) -> None:
             h = max(widget_wh[1], 1)
         aspect = max(w / float(max(h, 1)), 0.25)
         plot._avlite_aspect = (widget_wh, aspect)
-    else:
-        aspect = cached[1]
+        return aspect
+    return cached[1]
+
+
+def _view_window(plot, cx: float, cy: float, half_x: float) -> tuple[float, float, float, float]:
+    aspect = _plot_aspect(plot)
     half_x = float(half_x)
     half_y = half_x / aspect
-    plot.setRange(
-        xRange=(float(cx) - half_x, float(cx) + half_x),
-        yRange=(float(cy) - half_y, float(cy) + half_y),
-        padding=0.0,
-        disableAutoRange=True,
-    )
+    return (float(cx) - half_x, float(cx) + half_x, float(cy) - half_y, float(cy) + half_y)
+
+
+def _set_equal_view(plot, cx: float, cy: float, half_x: float) -> tuple[float, float, float, float]:
+    """Pan to ``(cx, cy)`` at a constant scale. No auto-range.
+
+    The pixel aspect is cached for the current widget size so a 1px axis
+    tweak cannot change the zoom. The range upload is skipped when the camera
+    has not moved by a centimeter.
+    """
+    window = _view_window(plot, cx, cy, half_x)
+    token = tuple(round(v, 2) for v in window)
+    if getattr(plot, "_avlite_range", None) != token:
+        plot._avlite_range = token
+        x0, x1, y0, y1 = window
+        plot.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.0, disableAutoRange=True)
+    return window
 
 _WIDGETS_READY = False
 
@@ -414,9 +610,9 @@ def _install_widgets() -> None:
             self._hover_plan_xy: Optional[np.ndarray] = None
             self._hover_plan_v: Optional[np.ndarray] = None
 
-            self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2))
-            self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2))
-            self.global_plan = self.plotItem.plot(pen=pg.mkPen("#4fc3f7", width=3))
+            self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2), connect="finite")
+            self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
+            self.global_plan = self.plotItem.plot(pen=pg.mkPen("#4fc3f7", width=3), connect="finite")
             self.global_plan_speed = pg.ScatterPlotItem(size=7, pen=None, pxMode=True)
             self.addItem(self.global_plan_speed)
             self.hdmap_lanes: list[pg.PlotDataItem] = []
@@ -464,6 +660,9 @@ def _install_widgets() -> None:
             self._fps = 0.0
             self._fps_t0 = time.perf_counter()
             self._fps_frames = 0
+            self._curve_cache: dict = {}
+            self._geom_token = None
+            self._geom = None
 
         def reset(self) -> None:
             self._map_bounds = None
@@ -471,6 +670,10 @@ def _install_widgets() -> None:
             self._start_point = None
             self._drag_pan = False
             self._orienting = False
+            self._curve_cache.clear()
+            self._geom_token = None
+            self._geom = None
+            self._avlite_range = None
             self.orient_line.setData([], [])
             for item in self.hdmap_lanes:
                 self.removeItem(item)
@@ -662,15 +865,43 @@ def _install_widgets() -> None:
                 status.set(text)
 
         def _paint_plan_speed(self, xs, ys, vel) -> None:
-            if vel is None or len(xs) == 0:
-                self.global_plan_speed.setData([], [])
+            xs = np.asarray(xs, dtype=float).ravel()
+            ys = np.asarray(ys, dtype=float).ravel()
+            vel_a = np.asarray([] if vel is None else vel, dtype=float).ravel()
+            n = min(int(xs.size), int(ys.size), int(vel_a.size)) if vel_a.size else 0
+            if n == 0:
+                _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
                 return
-            n = min(len(xs), len(vel))
             step = max(1, n // 400)
             scale = str(getattr(self.root.setting.schema, "p66_global_plan_velocity_scale", "relative"))
-            colors = _velocity_colors(np.asarray(vel[:n])[::step], scale)
+            sample = vel_a[:n:max(1, n // 8)]
+            token = (n, step, scale, round(float(np.nansum(sample)), 2))
+            if self._curve_cache.get("speed") == token:
+                return
+            self._curve_cache["speed"] = token
+            colors = _velocity_colors(vel_a[:n:step], scale)
             brushes = [pg.mkBrush(*c) for c in colors]
             self.global_plan_speed.setData(xs[:n:step], ys[:n:step], brush=brushes)
+
+        def _geom_for(self, plan):
+            traj = getattr(plan, "trajectory", None) if plan is not None else None
+            size = len(traj.path_x) if traj is not None and getattr(traj, "path_x", None) is not None else 0
+            token = (id(plan), id(traj), size)
+            if token == self._geom_token and self._geom is not None:
+                return self._geom
+            geom = _plan_arrays(plan) if plan is not None else None
+            self._geom_token = token
+            self._geom = geom
+            if geom is not None and geom["refx"].size:
+                self._hover_plan_xy = np.column_stack([geom["refx"], geom["refy"]])
+                vel = geom["vel"]
+                self._hover_plan_v = vel[: geom["refx"].size] if vel.size else None
+            else:
+                self._hover_plan_xy = None
+                self._hover_plan_v = None
+            if geom is not None and geom["bounds"] is not None:
+                self._map_bounds = geom["bounds"]
+            return geom
 
         def _paint_waypoints(self, stack, plan) -> None:
             gt = None
@@ -679,8 +910,8 @@ def _install_widgets() -> None:
             if gt is None and plan is not None:
                 gt = getattr(plan, "trajectory", None)
             if gt is None or not hasattr(gt, "current_wp"):
-                self.g_wp_current.setData([], [])
-                self.g_wp_next.setData([], [])
+                _push_hidden(self._curve_cache, self.g_wp_current, "gwp")
+                _push_hidden(self._curve_cache, self.g_wp_next, "gwn")
                 return
             try:
                 i = int(gt.current_wp)
@@ -688,28 +919,29 @@ def _install_widgets() -> None:
                 xs = np.asarray(gt.path_x, dtype=float)
                 ys = np.asarray(gt.path_y, dtype=float)
             except Exception:
-                self.g_wp_current.setData([], [])
-                self.g_wp_next.setData([], [])
+                _push_hidden(self._curve_cache, self.g_wp_current, "gwp")
+                _push_hidden(self._curve_cache, self.g_wp_next, "gwn")
                 return
             if 0 <= i < len(xs):
-                self.g_wp_current.setData([float(xs[i])], [float(ys[i])])
+                _set_curve(self._curve_cache, self.g_wp_current, "gwp", [xs[i]], [ys[i]])
             else:
-                self.g_wp_current.setData([], [])
+                _push_hidden(self._curve_cache, self.g_wp_current, "gwp")
             if 0 <= j < len(xs):
-                self.g_wp_next.setData([float(xs[j])], [float(ys[j])])
+                _set_curve(self._curve_cache, self.g_wp_next, "gwn", [xs[j]], [ys[j]])
             else:
-                self.g_wp_next.setData([], [])
+                _push_hidden(self._curve_cache, self.g_wp_next, "gwn")
 
         def _paint_heading(self, ego, setting) -> None:
             if not setting.p66_show_state.get():
-                self.heading_line.setData([], [])
+                _push_hidden(self._curve_cache, self.heading_line, "hdg")
                 return
             ctrl = getattr(self.root.exec, "controller", None)
             front = float(getattr(ctrl, "ego_distance_front_axle", 2.5) or 2.5)
             length = float(getattr(ego, "length", front + 1.0) or (front + 1.0))
             rear = max(length - front, 0.0)
             c, s = float(np.cos(ego.theta)), float(np.sin(ego.theta))
-            self.heading_line.setData(
+            _set_curve(
+                self._curve_cache, self.heading_line, "hdg",
                 [ego.x + front * c, ego.x - rear * c],
                 [ego.y + front * s, ego.y - rear * s],
             )
@@ -718,11 +950,11 @@ def _install_widgets() -> None:
             lp = stack.local_planner
             loc = getattr(lp, "location_xy", None) if lp is not None else None
             if loc is None:
-                self.planner_marker.setData([], [])
+                _push_hidden(self._curve_cache, self.planner_marker, "ploc")
                 self.planner_text.hide()
                 return
             x, y = float(loc[0]), float(loc[1])
-            self.planner_marker.setData([x], [y])
+            _set_curve(self._curve_cache, self.planner_marker, "ploc", [x], [y])
             self.planner_text.setPos(x, y)
             self.planner_text.show()
 
@@ -791,16 +1023,22 @@ def _install_widgets() -> None:
             if (plan is None or getattr(plan, "trajectory", None) is None) and stack.local_planner is not None:
                 plan = getattr(stack.local_planner, "global_plan", None)
 
-            if setting.p66_show_global_plan_boundaries.get() and plan is not None:
-                self.left_boundary.setData(*_safe_xy(plan.left_boundary_x, plan.left_boundary_y))
-                self.right_boundary.setData(*_safe_xy(plan.right_boundary_x, plan.right_boundary_y))
-                xs = list(plan.left_boundary_x or []) + list(plan.right_boundary_x or [])
-                ys = list(plan.left_boundary_y or []) + list(plan.right_boundary_y or [])
-                if xs and ys:
-                    self._map_bounds = (min(xs), max(xs), min(ys), max(ys))
+            zoom = float(setting.p66_global_zoom)
+            cx = ego.x + self._center_delta[0]
+            cy = ego.y + self._center_delta[1]
+            if setting.p66_global_view_follow_planner.get() and stack.local_planner is not None:
+                loc = getattr(stack.local_planner, "location_xy", None)
+                if loc is not None:
+                    cx, cy = float(loc[0]), float(loc[1])
+            window = _view_window(self, cx, cy, zoom)
+            geom = self._geom_for(plan) if plan is not None else None
+
+            if setting.p66_show_global_plan_boundaries.get() and geom is not None:
+                _push_windowed(self._curve_cache, self.left_boundary, "lb", geom["lbx"], geom["lby"], window)
+                _push_windowed(self._curve_cache, self.right_boundary, "rb", geom["rbx"], geom["rby"], window)
             else:
-                self.left_boundary.setData([], [])
-                self.right_boundary.setData([], [])
+                _push_hidden(self._curve_cache, self.left_boundary, "lb")
+                _push_hidden(self._curve_cache, self.right_boundary, "rb")
 
             # HD map lanes (static-ish; redraw when empty)
             gp = stack.global_planner
@@ -831,36 +1069,27 @@ def _install_widgets() -> None:
                 if all_x and all_y:
                     self._map_bounds = (min(all_x), max(all_x), min(all_y), max(all_y))
 
-            if setting.p66_show_global_plan.get() and plan is not None and plan.trajectory is not None:
-                traj = plan.trajectory
-                xs, ys = _safe_xy(traj.path_x, traj.path_y)
-                self.global_plan.setData(xs, ys)
-                if len(xs):
-                    self._hover_plan_xy = np.column_stack([xs, ys])
-                    vel = getattr(traj, "velocity", None)
-                    self._hover_plan_v = (
-                        np.asarray(vel, dtype=float).ravel()[: len(xs)] if vel is not None else None
-                    )
-                    self._paint_plan_speed(xs, ys, self._hover_plan_v)
-                else:
-                    self.global_plan_speed.setData([], [])
+            if setting.p66_show_global_plan.get() and geom is not None and geom["traj"] is not None:
+                _push_windowed(self._curve_cache, self.global_plan, "gp", geom["refx"], geom["refy"], window)
+                self._paint_plan_speed(geom["refx"], geom["refy"], geom["vel"])
             else:
-                self.global_plan.setData([], [])
-                self.global_plan_speed.setData([], [])
+                _push_hidden(self._curve_cache, self.global_plan, "gp")
+                _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
                 self._hover_plan_xy = None
+                self._hover_plan_v = None
 
             self._paint_waypoints(stack, plan)
             self._paint_heading(ego, setting)
             self._paint_planner_loc(stack, setting)
 
-            # Ego
+            pose = (round(float(ego.x), 3), round(float(ego.y), 3), round(float(ego.theta), 4))
             if setting.p66_show_state.get():
                 bx, by = _closed_poly(ego.get_bb_corners())
-                self.ego_box.setData(bx, by)
-                self.ego_marker.setData([ego.x], [ego.y])
+                _set_curve(self._curve_cache, self.ego_box, "ego", bx, by, pose)
+                _set_curve(self._curve_cache, self.ego_marker, "ego_m", [ego.x], [ego.y], pose)
             else:
-                self.ego_box.setData([], [])
-                self.ego_marker.setData([], [])
+                _push_hidden(self._curve_cache, self.ego_box, "ego")
+                _push_hidden(self._curve_cache, self.ego_marker, "ego_m")
 
             if setting.p66_show_past_locations.get() and stack.local_planner is not None:
                 hist = getattr(stack.local_planner, "past_locations", None) or getattr(
@@ -869,20 +1098,14 @@ def _install_widgets() -> None:
                 if hist:
                     pts = np.asarray(hist[-100:], dtype=float)
                     if pts.ndim == 2 and pts.shape[1] >= 2:
-                        self.past_path.setData(pts[:, 0], pts[:, 1])
+                        _set_curve(self._curve_cache, self.past_path, "past", pts[:, 0], pts[:, 1])
                     else:
-                        self.past_path.setData([], [])
+                        _push_hidden(self._curve_cache, self.past_path, "past")
                 else:
-                    self.past_path.setData([], [])
+                    _push_hidden(self._curve_cache, self.past_path, "past")
+            else:
+                _push_hidden(self._curve_cache, self.past_path, "past")
 
-            # View window. One explicit range; axis pixels stay fixed (see _pin_plot_chrome).
-            zoom = float(setting.p66_global_zoom)
-            cx = ego.x + self._center_delta[0]
-            cy = ego.y + self._center_delta[1]
-            if setting.p66_global_view_follow_planner.get() and stack.local_planner is not None:
-                loc = getattr(stack.local_planner, "location_xy", None)
-                if loc is not None:
-                    cx, cy = float(loc[0]), float(loc[1])
             _set_equal_view(self, cx, cy, zoom)
 
             dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -930,6 +1153,17 @@ def _install_widgets() -> None:
 
             self._init_curves()
             self._last_draw_ms = 0.0
+            self._curve_cache: dict = {}
+            self._track_cache = None
+            self._lidar_cache = None
+            self._geom_token = None
+            self._geom = None
+            self._vis_flags = None
+            self._xy_window = None
+            self._sd_window = None
+            self._xy_on = True
+            self._frenet_on = True
+            self._flow_lut_cache = None
             self._left_anchor: Optional[tuple[float, float]] = None
             self._right_anchor: Optional[tuple[float, float]] = None
             self._spawn_agent = None
@@ -942,10 +1176,10 @@ def _install_widgets() -> None:
             attach_plot_mouse(self.frenet_plot, _PaneMouse(self, frenet=True))
 
         def _init_curves(self) -> None:
-            self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2))
-            self.xy_right = self.xy_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2))
-            self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#888888", width=2))
-            self.xy_local = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3))
+            self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2), connect="finite")
+            self.xy_right = self.xy_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
+            self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#888888", width=2), connect="finite")
+            self.xy_local = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
             self.xy_ego = self.xy_plot.plotItem.plot(pen=pg.mkPen("r", width=2))
             self.xy_agents = [
                 self.xy_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
@@ -998,10 +1232,10 @@ def _install_widgets() -> None:
             self.xy_occ.hide()
             self.xy_flow.hide()
 
-            self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=1))
-            self.sd_right = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=1))
-            self.sd_ref = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#888888", width=1))
-            self.sd_local = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3))
+            self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=1), connect="finite")
+            self.sd_right = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=1), connect="finite")
+            self.sd_ref = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#888888", width=1), connect="finite")
+            self.sd_local = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
             self.sd_ego = self.frenet_plot.plotItem.plot(pen=pg.mkPen("r", width=2))
             self.sd_agents = [
                 self.frenet_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
@@ -1075,6 +1309,14 @@ def _install_widgets() -> None:
             self.xy_occ.hide()
             self.xy_flow.hide()
             self.layer_point_counts.clear()
+            self._curve_cache.clear()
+            self._track_cache = None
+            self._lidar_cache = None
+            self._geom_token = None
+            self._geom = None
+            self._vis_flags = None
+            self.xy_plot._avlite_range = None
+            self.frenet_plot._avlite_range = None
             self._hide_ruler()
 
         def update_theme(self, bg: str, fg: str) -> None:
@@ -1085,9 +1327,17 @@ def _install_widgets() -> None:
 
         def update_visibility(self) -> None:
             s = self.root.setting
-            self.xy_plot.setVisible(bool(s.p67_show_local_global_view.get()))
-            self.frenet_plot.setVisible(bool(s.p67_show_local_frenet_view.get()))
-            self.legend.setVisible(bool(s.p66_show_legend.get()))
+            flags = (
+                bool(s.p67_show_local_global_view.get()),
+                bool(s.p67_show_local_frenet_view.get()),
+                bool(s.p66_show_legend.get()),
+            )
+            if self._vis_flags == flags:
+                return
+            self._vis_flags = flags
+            self.xy_plot.setVisible(flags[0])
+            self.frenet_plot.setVisible(flags[1])
+            self.legend.setVisible(flags[2])
 
         def _status(self, text: str) -> None:
             status = getattr(self.root.setting, "perception_status_text", None)
@@ -1222,34 +1472,32 @@ def _install_widgets() -> None:
                 return 0.0
             s = self.root.setting
             self.update_visibility()
+            self._xy_on = bool(s.p67_show_local_global_view.get())
+            self._frenet_on = bool(s.p67_show_local_frenet_view.get())
             ego = stack.ego_state
             lp = stack.local_planner
             gt = getattr(lp, "global_trajectory", None) if lp is not None else None
-
-            # Boundaries / reference
             plan = getattr(lp, "global_plan", None) if lp is not None else None
-            if plan is not None and s.p66_show_race_boundary.get():
-                self.xy_left.setData(*_safe_xy(plan.left_boundary_x, plan.left_boundary_y))
-                self.xy_right.setData(*_safe_xy(plan.right_boundary_x, plan.right_boundary_y))
-            else:
-                self.xy_left.setData([], [])
-                self.xy_right.setData([], [])
 
-            if plan is not None and plan.trajectory is not None and s.p66_show_global_plan.get():
-                self.xy_ref.setData(*_safe_xy(plan.trajectory.path_x, plan.trajectory.path_y))
-                if gt is not None:
-                    # Frenet reference: s along path, d≈0
-                    sx = np.asarray(plan.trajectory.path_s, dtype=float)
-                    self.sd_ref.setData(sx, np.zeros_like(sx))
-                    if hasattr(plan, "left_boundary_d") and plan.left_boundary_d is not None:
-                        sd_s = np.asarray(getattr(plan, "path_s", plan.trajectory.path_s), dtype=float)
-                        n = min(len(sd_s), len(plan.left_boundary_d), len(plan.right_boundary_d))
-                        self.sd_left.setData(sd_s[:n], np.asarray(plan.left_boundary_d[:n], dtype=float))
-                        self.sd_right.setData(sd_s[:n], np.asarray(plan.right_boundary_d[:n], dtype=float))
-            else:
-                self.xy_ref.setData([], [])
-                self.sd_ref.setData([], [])
+            zoom = float(s.p66_xy_zoom)
+            cx, cy = float(ego.x), float(ego.y)
+            if s.p66_global_view_follow_planner.get() and lp is not None:
+                loc = getattr(lp, "location_xy", None)
+                if loc is not None:
+                    cx, cy = float(loc[0]), float(loc[1])
+            self._xy_window = _view_window(self.xy_plot, cx, cy, zoom) if self._xy_on else None
 
+            fzoom = float(s.p66_frenet_zoom)
+            cs, cd = 0.0, 0.0
+            if self._frenet_on and gt is not None:
+                try:
+                    sd_ego = gt.convert_xy_to_sd(ego.x, ego.y)
+                    cs, cd = float(sd_ego[0]), float(sd_ego[1])
+                except Exception:
+                    cs, cd = 0.0, 0.0
+            self._sd_window = _view_window(self.frenet_plot, cs, cd, fzoom) if self._frenet_on else None
+
+            self._paint_static_plan(plan, gt, s)
             self._paint_local_plan(lp, gt, s)
             self._paint_lattice(lp, gt, s)
             self._paint_track(stack, plan, gt, s)
@@ -1259,54 +1507,88 @@ def _install_widgets() -> None:
             self._paint_predictions(stack, ego, gt, s)
             self._paint_occupancy(stack, s)
 
-            # View windows. Equal scale from the pinned view box, not auto-range.
-            zoom = float(s.p66_xy_zoom)
-            cx, cy = ego.x, ego.y
-            if s.p66_global_view_follow_planner.get() and lp is not None:
-                loc = getattr(lp, "location_xy", None)
-                if loc is not None:
-                    cx, cy = float(loc[0]), float(loc[1])
-            _set_equal_view(self.xy_plot, cx, cy, zoom)
-
-            fzoom = float(s.p66_frenet_zoom)
-            if gt is not None:
-                try:
-                    sd_ego = gt.convert_xy_to_sd(ego.x, ego.y)
-                    cs, cd = float(sd_ego[0]), float(sd_ego[1])
-                except Exception:
-                    cs, cd = 0.0, 0.0
-            else:
-                cs, cd = 0.0, 0.0
-            _set_equal_view(self.frenet_plot, cs, cd, fzoom)
+            if self._xy_on:
+                _set_equal_view(self.xy_plot, cx, cy, zoom)
+            if self._frenet_on:
+                _set_equal_view(self.frenet_plot, cs, cd, fzoom)
 
             self._last_draw_ms = (time.perf_counter() - t0) * 1000.0
             return self._last_draw_ms
 
         def _count(self, name: str, xs) -> None:
-            self.layer_point_counts[name] = int(np.count_nonzero(np.isfinite(np.asarray(xs, dtype=float)))) if len(xs) else 0
+            arr = np.asarray(xs, dtype=float).ravel() if xs is not None else np.array([])
+            self.layer_point_counts[name] = int(np.count_nonzero(np.isfinite(arr))) if arr.size else 0
+
+        def _remember_plan(self, plan):
+            traj = getattr(plan, "trajectory", None) if plan is not None else None
+            size = len(traj.path_x) if traj is not None and getattr(traj, "path_x", None) is not None else 0
+            token = (id(plan), id(traj), size)
+            if token == self._geom_token and self._geom is not None:
+                return self._geom
+            self._geom_token = token
+            self._geom = _plan_arrays(plan) if plan is not None else None
+            return self._geom
+
+        def _paint_static_plan(self, plan, gt, s) -> None:
+            show_b = plan is not None and bool(s.p66_show_race_boundary.get())
+            show_g = (
+                plan is not None
+                and getattr(plan, "trajectory", None) is not None
+                and bool(s.p66_show_global_plan.get())
+            )
+            if not show_b and not show_g:
+                for key, item in (
+                    ("ll", self.xy_left), ("lr", self.xy_right), ("lref", self.xy_ref),
+                    ("sdl", self.sd_left), ("sdr", self.sd_right), ("sdref", self.sd_ref),
+                ):
+                    _push_hidden(self._curve_cache, item, key)
+                return
+            geom = self._remember_plan(plan)
+            if show_b and self._xy_on:
+                _push_windowed(self._curve_cache, self.xy_left, "ll", geom["lbx"], geom["lby"], self._xy_window)
+                _push_windowed(self._curve_cache, self.xy_right, "lr", geom["rbx"], geom["rby"], self._xy_window)
+            else:
+                _push_hidden(self._curve_cache, self.xy_left, "ll")
+                _push_hidden(self._curve_cache, self.xy_right, "lr")
+            if show_g and self._xy_on:
+                _push_windowed(self._curve_cache, self.xy_ref, "lref", geom["refx"], geom["refy"], self._xy_window)
+            else:
+                _push_hidden(self._curve_cache, self.xy_ref, "lref")
+            if show_g and self._frenet_on and gt is not None and geom["refs"].size:
+                _push_windowed(
+                    self._curve_cache, self.sd_ref, "sdref",
+                    geom["refs"], np.zeros(geom["refs"].shape, dtype=float), self._sd_window,
+                )
+                if geom["sd_s"].size:
+                    _push_windowed(self._curve_cache, self.sd_left, "sdl", geom["sd_s"], geom["sd_l"], self._sd_window)
+                    _push_windowed(self._curve_cache, self.sd_right, "sdr", geom["sd_s"], geom["sd_r"], self._sd_window)
+                else:
+                    _push_hidden(self._curve_cache, self.sd_left, "sdl")
+                    _push_hidden(self._curve_cache, self.sd_right, "sdr")
+            else:
+                _push_hidden(self._curve_cache, self.sd_ref, "sdref")
+                _push_hidden(self._curve_cache, self.sd_left, "sdl")
+                _push_hidden(self._curve_cache, self.sd_right, "sdr")
 
         def _paint_local_plan(self, lp, gt, s) -> None:
-            paths = _local_plan_paths(lp) if lp is not None and s.p66_show_local_plan.get() else []
-            xs, ys = _nan_join(paths)
-            self.xy_local.setData(xs, ys)
-            self._count("local_plan_xy", xs)
-            if gt is not None and paths:
-                sd_paths = [_to_sd(gt, p) for p in paths]
-                sx, sy = _nan_join(sd_paths)
-                self.sd_local.setData(sx, sy)
-            else:
-                self.sd_local.setData([], [])
+            show = lp is not None and bool(s.p66_show_local_plan.get())
+            paths = _local_plan_paths(lp) if show else []
+            token = (show, self._xy_on, self._frenet_on, id(gt) if gt is not None else 0, _paths_token(paths))
+            xs, ys = _nan_join(paths) if paths else (np.array([]), np.array([]))
+            if self._curve_cache.get("local") != token:
+                self._curve_cache["local"] = token
+                if self._xy_on:
+                    self.xy_local.setData(xs, ys)
+                else:
+                    self.xy_local.setData([], [])
+                if self._frenet_on and gt is not None and paths:
+                    self.sd_local.setData(*_nan_join([_to_sd(gt, p) for p in paths]))
+                else:
+                    self.sd_local.setData([], [])
+            self._count("local_plan_xy", xs if self._xy_on else [])
             self._paint_local_waypoints(lp, gt, s, paths)
 
         def _paint_local_waypoints(self, lp, gt, s, paths) -> None:
-            self.xy_lwp.setData([], [])
-            self.xy_lwp_next.setData([], [])
-            self.sd_lwp.setData([], [])
-            self.sd_lwp_next.setData([], [])
-            self.xy_wp.setData([], [])
-            self.xy_wp_next.setData([], [])
-            self.sd_wp.setData([], [])
-            self.sd_wp_next.setData([], [])
             if gt is not None and hasattr(gt, "current_wp") and getattr(gt, "path_x", None) is not None:
                 try:
                     i = int(gt.current_wp)
@@ -1315,15 +1597,40 @@ def _install_widgets() -> None:
                     py = np.asarray(gt.path_y, dtype=float)
                     ps = np.asarray(getattr(gt, "path_s", px), dtype=float)
                     pd = np.asarray(getattr(gt, "path_d", np.zeros_like(px)), dtype=float)
-                    if 0 <= i < len(px):
-                        self.xy_wp.setData([float(px[i])], [float(py[i])])
-                        self.sd_wp.setData([float(ps[i])], [float(pd[i])])
-                    if 0 <= j < len(px):
-                        self.xy_wp_next.setData([float(px[j])], [float(py[j])])
-                        self.sd_wp_next.setData([float(ps[j])], [float(pd[j])])
+                    if self._xy_on and 0 <= i < len(px):
+                        _set_curve(self._curve_cache, self.xy_wp, "xwp", [px[i]], [py[i]])
+                    else:
+                        _push_hidden(self._curve_cache, self.xy_wp, "xwp")
+                    if self._frenet_on and 0 <= i < len(ps):
+                        _set_curve(self._curve_cache, self.sd_wp, "swp", [ps[i]], [pd[i]])
+                    else:
+                        _push_hidden(self._curve_cache, self.sd_wp, "swp")
+                    if self._xy_on and 0 <= j < len(px):
+                        _set_curve(self._curve_cache, self.xy_wp_next, "xwn", [px[j]], [py[j]])
+                    else:
+                        _push_hidden(self._curve_cache, self.xy_wp_next, "xwn")
+                    if self._frenet_on and 0 <= j < len(ps):
+                        _set_curve(self._curve_cache, self.sd_wp_next, "swn", [ps[j]], [pd[j]])
+                    else:
+                        _push_hidden(self._curve_cache, self.sd_wp_next, "swn")
                 except Exception:
-                    pass
+                    for key, item in (
+                        ("xwp", self.xy_wp), ("xwn", self.xy_wp_next),
+                        ("swp", self.sd_wp), ("swn", self.sd_wp_next),
+                    ):
+                        _push_hidden(self._curve_cache, item, key)
+            else:
+                for key, item in (
+                    ("xwp", self.xy_wp), ("xwn", self.xy_wp_next),
+                    ("swp", self.sd_wp), ("swn", self.sd_wp_next),
+                ):
+                    _push_hidden(self._curve_cache, item, key)
             if not paths or lp is None:
+                for key, item in (
+                    ("xlwp", self.xy_lwp), ("xlwn", self.xy_lwp_next),
+                    ("slwp", self.sd_lwp), ("slwn", self.sd_lwp_next),
+                ):
+                    _push_hidden(self._curve_cache, item, key)
                 return
             local = None
             getter = getattr(lp, "get_local_plan", None)
@@ -1343,31 +1650,63 @@ def _install_widgets() -> None:
             try:
                 x, y = traj.get_current_xy()
                 x2, y2 = traj.get_xy_by_waypoint(int(traj.next_wp))
-                self.xy_lwp.setData([float(x)], [float(y)])
-                self.xy_lwp_next.setData([float(x2)], [float(y2)])
-                if gt is not None:
+                token = (
+                    round(float(x), 3), round(float(y), 3),
+                    round(float(x2), 3), round(float(y2), 3),
+                    self._frenet_on, id(gt) if gt is not None else 0,
+                )
+                if self._curve_cache.get("lwp") == token:
+                    return
+                self._curve_cache["lwp"] = token
+                if self._xy_on:
+                    self.xy_lwp.setData([float(x)], [float(y)])
+                    self.xy_lwp_next.setData([float(x2)], [float(y2)])
+                if self._frenet_on and gt is not None:
                     s0, d0 = gt.convert_xy_to_sd(float(x), float(y))
                     s1, d1 = gt.convert_xy_to_sd(float(x2), float(y2))
                     self.sd_lwp.setData([float(s0)], [float(d0)])
                     self.sd_lwp_next.setData([float(s1)], [float(d1)])
+                else:
+                    self.sd_lwp.setData([], [])
+                    self.sd_lwp_next.setData([], [])
             except Exception:
                 return
 
         def _paint_lattice(self, lp, gt, s) -> None:
+            show = lp is not None and bool(s.p66_show_local_lattice.get())
+            edges = _lattice_edges(lp)[:240] if show else []
+            if edges:
+                xy0 = _edge_xy(edges[0])
+                xy1 = _edge_xy(edges[-1])
+                token = (
+                    len(edges),
+                    int(xy0.shape[0]) if getattr(xy0, "ndim", 0) == 2 else 0,
+                    round(float(xy0.flat[0]), 3) if xy0.size else 0.0,
+                    round(float(xy0.flat[-1]), 3) if xy0.size else 0.0,
+                    round(float(xy1.flat[0]), 3) if xy1.size else 0.0,
+                    round(float(xy1.flat[-1]), 3) if xy1.size else 0.0,
+                    self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
+                )
+            else:
+                token = (0, self._xy_on, self._frenet_on)
+            if self._curve_cache.get("lattice") == token:
+                return
+            self._curve_cache["lattice"] = token
             buckets = {"feasible": [], "collision": [], "kinematic": []}
             sd_buckets = {"feasible": [], "collision": [], "kinematic": []}
-            if lp is not None and s.p66_show_local_lattice.get():
-                for edge in _lattice_edges(lp)[:240]:
-                    xy = _edge_xy(edge)
-                    if len(xy) < 2:
-                        continue
-                    kind = _edge_kind(edge, lp)
-                    buckets[kind].append(xy)
-                    sd = _edge_sd(edge)
-                    if len(sd) >= 2:
-                        sd_buckets[kind].append(sd)
-                    elif gt is not None:
-                        sd_buckets[kind].append(_to_sd(gt, xy))
+            for edge in edges:
+                xy = _edge_xy(edge)
+                if len(xy) < 2:
+                    continue
+                kind = _edge_kind(edge, lp)
+                buckets[kind].append(xy)
+                if not self._frenet_on:
+                    continue
+                sd = _edge_sd(edge)
+                if len(sd) >= 2:
+                    sd_buckets[kind].append(sd)
+                elif gt is not None:
+                    sd_buckets[kind].append(_to_sd(gt, xy))
             mapping = (
                 ("feasible", self.xy_lattice, self.sd_lattice),
                 ("collision", self.xy_lattice_hit, self.sd_lattice_hit),
@@ -1378,30 +1717,65 @@ def _install_widgets() -> None:
                 xy_item.setData(xs, ys)
                 sx, sy = _nan_join(sd_buckets[kind])
                 sd_item.setData(sx, sy)
-                self.layer_point_counts[f"lattice_{kind}"] = int(np.count_nonzero(np.isfinite(xs))) if xs else 0
+                self.layer_point_counts[f"lattice_{kind}"] = int(np.count_nonzero(np.isfinite(xs))) if xs.size else 0
             self.layer_point_counts["lattice_xy"] = sum(
                 self.layer_point_counts.get(f"lattice_{k}", 0) for k in buckets
             )
 
+        def _cached_track(self, stack, plan, gt):
+            segs = _track_segments(getattr(stack, "world", None), plan)
+            arr = np.asarray(segs, dtype=float) if segs is not None else np.zeros((0, 2, 2))
+            if arr.ndim != 3 or arr.shape[0] == 0 or arr.shape[-1] < 2 or arr.shape[-2] < 2:
+                self._track_cache = None
+                return None
+            gt_id = id(gt) if gt is not None else 0
+            key = (gt_id, arr.shape, float(arr.flat[0]), float(arr.flat[-1]))
+            cached = self._track_cache
+            if cached is not None and cached[0] == key:
+                return cached
+            sd_segs = None
+            if gt is not None:
+                pts = np.ascontiguousarray(arr.reshape(-1, arr.shape[-1])[:, :2])
+                sd = _to_sd(gt, pts)
+                if sd.shape[0] == pts.shape[0] and sd.size:
+                    sd_segs = sd.reshape(-1, 2, 2)
+                    s_diff = np.abs(sd_segs[:, 1, 0] - sd_segs[:, 0, 0])
+                    med = float(np.median(s_diff)) if s_diff.size else 0.0
+                    sd_segs = sd_segs[s_diff < (med * 20.0 + 50.0)]
+            self._track_cache = (key, arr, sd_segs)
+            return self._track_cache
+
         def _paint_track(self, stack, plan, gt, s) -> None:
-            segs = _track_segments(getattr(stack, "world", None), plan) if s.p66_show_race_boundary.get() else None
-            xs, ys = _segments_xy(segs)
-            self.xy_track.setData(xs, ys)
-            self._count("track_xy", xs)
-            if gt is None or not xs:
-                self.sd_track.setData([], [])
+            if not s.p66_show_race_boundary.get():
+                _push_hidden(self._curve_cache, self.xy_track, "track_xy")
+                _push_hidden(self._curve_cache, self.sd_track, "track_sd")
+                self.layer_point_counts["track_xy"] = 0
                 return
-            arr = np.asarray(segs, dtype=float)
-            sd_paths = []
-            for i in range(arr.shape[0]):
-                sd = _to_sd(gt, arr[i, :, :2])
-                if len(sd) < 2:
-                    continue
-                if abs(float(sd[0, 0]) - float(sd[1, 0])) > 80.0:
-                    continue
-                sd_paths.append(sd)
-            sx, sy = _nan_join(sd_paths)
-            self.sd_track.setData(sx, sy)
+            cached = self._cached_track(stack, plan, gt)
+            if cached is None:
+                _push_hidden(self._curve_cache, self.xy_track, "track_xy")
+                _push_hidden(self._curve_cache, self.sd_track, "track_sd")
+                self.layer_point_counts["track_xy"] = 0
+                return
+            key, arr, sd_segs = cached
+            if self._xy_on:
+                wtok = _window_token(self._xy_window)
+                token = ("xy", key, wtok)
+                if self._curve_cache.get("track_xy") != token:
+                    self._curve_cache["track_xy"] = token
+                    xs, ys = _segments_xy(_clip_segments(arr, self._xy_window))
+                    self.xy_track.setData(xs, ys)
+                    self._count("track_xy", xs)
+            else:
+                _push_hidden(self._curve_cache, self.xy_track, "track_xy")
+                self.layer_point_counts["track_xy"] = 0
+            if self._frenet_on and sd_segs is not None and len(sd_segs):
+                token = ("sd", key, _window_token(self._sd_window))
+                if self._curve_cache.get("track_sd") != token:
+                    self._curve_cache["track_sd"] = token
+                    self.sd_track.setData(*_segments_xy(_clip_segments(sd_segs, self._sd_window)))
+            else:
+                _push_hidden(self._curve_cache, self.sd_track, "track_sd")
 
         def _world_pm(self, stack):
             world = getattr(stack, "world", None)
@@ -1425,41 +1799,67 @@ def _install_widgets() -> None:
 
         def _paint_ego(self, stack, ego, gt, s) -> None:
             if not s.p66_show_state.get():
+                if self._curve_cache.get("ego_off"):
+                    return
+                self._curve_cache["ego_off"] = True
+                self._curve_cache.pop("ego_pose", None)
+                self._curve_cache.pop("agents", None)
                 self.xy_ego.setData([], [])
                 self.sd_ego.setData([], [])
                 self.xy_heading.setData([], [])
                 for curve in self.xy_agents + self.sd_agents:
                     curve.setData([], [])
                 return
-            self.xy_ego.setData(*_closed_poly(ego.get_bb_corners()))
-            ctrl = stack.controller
-            front = float(getattr(ctrl, "ego_distance_front_axle", 2.5) or 2.5)
-            length = float(getattr(ego, "length", front + 1.0) or (front + 1.0))
-            rear = max(length - front, 0.0)
-            c, sn = float(np.cos(ego.theta)), float(np.sin(ego.theta))
-            self.xy_heading.setData(
-                [ego.x + front * c, ego.x - rear * c],
-                [ego.y + front * sn, ego.y - rear * sn],
+            self._curve_cache["ego_off"] = False
+            pose = (
+                round(float(ego.x), 3), round(float(ego.y), 3), round(float(ego.theta), 4),
+                self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
             )
-            if gt is not None:
-                try:
-                    sd_c = gt.convert_xy_path_to_sd_path_np(ego.get_bb_corners())
-                    if len(sd_c) >= 2 and abs(float(sd_c[0, 0]) - float(sd_c[1, 0])) < 10:
-                        self.sd_ego.setData(*_closed_poly(sd_c))
-                    else:
+            if self._curve_cache.get("ego_pose") != pose:
+                self._curve_cache["ego_pose"] = pose
+                if self._xy_on:
+                    self.xy_ego.setData(*_closed_poly(ego.get_bb_corners()))
+                    ctrl = stack.controller
+                    front = float(getattr(ctrl, "ego_distance_front_axle", 2.5) or 2.5)
+                    length = float(getattr(ego, "length", front + 1.0) or (front + 1.0))
+                    rear = max(length - front, 0.0)
+                    c, sn = float(np.cos(ego.theta)), float(np.sin(ego.theta))
+                    self.xy_heading.setData(
+                        [ego.x + front * c, ego.x - rear * c],
+                        [ego.y + front * sn, ego.y - rear * sn],
+                    )
+                else:
+                    self.xy_ego.setData([], [])
+                    self.xy_heading.setData([], [])
+                if self._frenet_on and gt is not None:
+                    try:
+                        sd_c = gt.convert_xy_path_to_sd_path_np(ego.get_bb_corners())
+                        if len(sd_c) >= 2 and abs(float(sd_c[0, 0]) - float(sd_c[1, 0])) < 10:
+                            self.sd_ego.setData(*_closed_poly(sd_c))
+                        else:
+                            self.sd_ego.setData([], [])
+                    except Exception:
                         self.sd_ego.setData([], [])
-                except Exception:
+                else:
                     self.sd_ego.setData([], [])
             agents = _agent_list(self._world_pm(stack) or stack.pm)[:12]
+            atoken = (
+                self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
+                tuple(
+                    (round(float(a.x), 2), round(float(a.y), 2), round(float(a.theta), 3))
+                    for a in agents
+                ),
+            )
+            if self._curve_cache.get("agents") == atoken:
+                return
+            self._curve_cache["agents"] = atoken
             for i, curve in enumerate(self.xy_agents):
-                if i < len(agents):
+                if self._xy_on and i < len(agents):
                     curve.setData(*_closed_poly(agents[i].get_bb_corners()))
                 else:
                     curve.setData([], [])
-            if gt is None:
-                return
             for i, curve in enumerate(self.sd_agents):
-                if i < len(agents):
+                if self._frenet_on and gt is not None and i < len(agents):
                     try:
                         sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
                         curve.setData(*_closed_poly(sd_c))
@@ -1479,55 +1879,112 @@ def _install_widgets() -> None:
             except Exception:
                 return True
 
+        def _fetch_lidar(self, stack):
+            try:
+                frame = stack.world.get_sensor_frame()
+                lidar = getattr(frame, "lidar", None)
+                pts = getattr(lidar, "points", None) if lidar is not None else None
+                if pts is None or len(pts) == 0:
+                    return None
+                arr = np.asarray(pts, dtype=float)
+                if arr.ndim == 2 and arr.shape[1] >= 2:
+                    return np.array(arr[:, :2], copy=True)
+            except Exception:
+                return None
+            return None
+
         def _paint_lidar(self, stack, gt, s) -> None:
-            lidar_xy = None
-            if self._lidar_allowed(stack):
-                try:
-                    frame = stack.world.get_sensor_frame()
-                    lidar = getattr(frame, "lidar", None)
-                    pts = getattr(lidar, "points", None) if lidar is not None else None
-                    if pts is not None and len(pts):
-                        arr = np.asarray(pts, dtype=float)
-                        if arr.ndim == 2 and arr.shape[1] >= 2:
-                            lidar_xy = arr[:, :2]
-                except Exception:
-                    lidar_xy = None
-            if lidar_xy is not None and s.p66_show_lidar_global.get():
-                self.xy_lidar.setData(lidar_xy[:, 0], lidar_xy[:, 1])
+            show_xy = self._xy_on and bool(s.p66_show_lidar_global.get())
+            show_sd = self._frenet_on and bool(s.p66_show_lidar_frenet.get())
+            if (not show_xy and not show_sd) or not self._lidar_allowed(stack):
+                if not self._curve_cache.get("lidar_off"):
+                    self.xy_lidar.setData([], [])
+                    self.sd_lidar.setData([], [])
+                    self.layer_point_counts["lidar_xy"] = 0
+                    self._curve_cache["lidar_off"] = True
+                    self._curve_cache.pop("lidar_xy", None)
+                    self._curve_cache.pop("lidar_sd", None)
+                return
+            self._curve_cache["lidar_off"] = False
+            ego = stack.ego_state
+            pose = (round(float(ego.x), 2), round(float(ego.y), 2), round(float(ego.theta), 3))
+            now = time.perf_counter()
+            cached = self._lidar_cache
+            if cached is not None and (cached[0] == pose or now - cached[2] < 0.05):
+                lidar_xy = cached[1]
+            else:
+                lidar_xy = self._fetch_lidar(stack)
+                self._lidar_cache = (pose, lidar_xy, now)
+            if show_xy and lidar_xy is not None and len(lidar_xy):
+                if self._curve_cache.get("lidar_xy") != id(lidar_xy):
+                    self.xy_lidar.setData(lidar_xy[:, 0], lidar_xy[:, 1])
+                    self._curve_cache["lidar_xy"] = id(lidar_xy)
                 self.layer_point_counts["lidar_xy"] = int(len(lidar_xy))
             else:
-                self.xy_lidar.setData([], [])
+                if self._curve_cache.get("lidar_xy") != 0:
+                    self.xy_lidar.setData([], [])
+                    self._curve_cache["lidar_xy"] = 0
                 self.layer_point_counts["lidar_xy"] = 0
-            if lidar_xy is not None and s.p66_show_lidar_frenet.get() and gt is not None:
-                sd = _to_sd(gt, lidar_xy)
-                self.sd_lidar.setData(sd[:, 0], sd[:, 1]) if len(sd) else self.sd_lidar.setData([], [])
-            else:
+            if show_sd and lidar_xy is not None and len(lidar_xy) and gt is not None:
+                if self._curve_cache.get("lidar_sd") != id(lidar_xy):
+                    sd = _to_sd(gt, lidar_xy)
+                    if len(sd):
+                        self.sd_lidar.setData(sd[:, 0], sd[:, 1])
+                    else:
+                        self.sd_lidar.setData([], [])
+                    self._curve_cache["lidar_sd"] = id(lidar_xy)
+            elif self._curve_cache.get("lidar_sd") != 0:
                 self.sd_lidar.setData([], [])
+                self._curve_cache["lidar_sd"] = 0
 
         def _paint_clusters(self, stack, gt, s) -> None:
-            xy = _cluster_xy(stack.pm) if s.p66_show_lidar_clusters.get() else None
-            if xy is not None and len(xy):
-                self.xy_clusters.setData(xy[:, 0], xy[:, 1])
-                self.layer_point_counts["clusters_xy"] = int(len(xy))
-                if gt is not None:
-                    sd = _to_sd(gt, xy)
-                    self.sd_clusters.setData(sd[:, 0], sd[:, 1]) if len(sd) else self.sd_clusters.setData([], [])
+            xy = _cluster_xy(stack.pm) if s.p66_show_lidar_clusters.get() and self._xy_on else None
+            if xy is None or len(xy) == 0:
+                if self._curve_cache.get("clu") != 0:
+                    self.xy_clusters.setData([], [])
+                    self.sd_clusters.setData([], [])
+                    self._curve_cache["clu"] = 0
+                    self.layer_point_counts["clusters_xy"] = 0
+                return
+            flat = xy.reshape(-1)
+            token = (
+                xy.shape,
+                round(float(flat[::max(1, flat.size // 8)].sum()), 3),
+                self._frenet_on,
+                id(gt) if gt is not None else 0,
+            )
+            self.layer_point_counts["clusters_xy"] = int(len(xy))
+            if self._curve_cache.get("clu") == token:
+                return
+            self._curve_cache["clu"] = token
+            self.xy_clusters.setData(xy[:, 0], xy[:, 1])
+            if self._frenet_on and gt is not None:
+                sd = _to_sd(gt, xy)
+                if len(sd):
+                    self.sd_clusters.setData(sd[:, 0], sd[:, 1])
                 else:
                     self.sd_clusters.setData([], [])
             else:
-                self.xy_clusters.setData([], [])
                 self.sd_clusters.setData([], [])
-                self.layer_point_counts["clusters_xy"] = 0
 
         def _paint_predictions(self, stack, ego, gt, s) -> None:
+            pred = getattr(stack.pm, "prediction", None) if stack.pm is not None else None
+            show = bool(s.p67_show_prediction.get()) and pred is not None
+            modes = _forecast_modes(pred) if show else []
+            token = (
+                show, self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
+                id(pred) if pred is not None else 0, _paths_token([m[2] for m in modes]),
+            )
+            if self._curve_cache.get("pred") == token:
+                return
+            self._curve_cache["pred"] = token
             ahead_xy: list[np.ndarray] = []
             behind_xy: list[np.ndarray] = []
             ellipses: list[np.ndarray] = []
-            pred = getattr(stack.pm, "prediction", None) if stack.pm is not None else None
-            if s.p67_show_prediction.get() and pred is not None:
+            if modes:
                 agents = {getattr(a, "agent_id", i): a for i, a in enumerate(_agent_list(stack.pm))}
                 heading = np.array([np.cos(float(ego.theta)), np.sin(float(ego.theta))])
-                for aid, mode, path, weight in _forecast_modes(pred):
+                for aid, mode, path, weight in modes:
                     agent = agents.get(aid)
                     pose = np.array([[float(agent.x), float(agent.y)]]) if agent is not None else path[:1]
                     full = np.vstack([pose, path]) if len(path) else path
@@ -1548,12 +2005,18 @@ def _install_widgets() -> None:
             ax, ay = _nan_join(ahead_xy)
             bx, by = _nan_join(behind_xy)
             ex, ey = _nan_join(ellipses)
-            self.xy_pred.setData(ax, ay)
-            self.xy_pred_behind.setData(bx, by)
-            self.xy_ellipses.setData(ex, ey)
-            self._count("prediction_xy", ax + bx)
-            self._count("prediction_ellipses", ex)
-            if gt is not None:
+            if self._xy_on:
+                self.xy_pred.setData(ax, ay)
+                self.xy_pred_behind.setData(bx, by)
+                self.xy_ellipses.setData(ex, ey)
+            else:
+                self.xy_pred.setData([], [])
+                self.xy_pred_behind.setData([], [])
+                self.xy_ellipses.setData([], [])
+            counted = np.concatenate([ax, bx]) if ax.size or bx.size else ax
+            self._count("prediction_xy", counted if self._xy_on else [])
+            self._count("prediction_ellipses", ex if self._xy_on else [])
+            if self._frenet_on and gt is not None:
                 self.sd_pred.setData(*_nan_join([_to_sd(gt, p) for p in ahead_xy]))
                 self.sd_pred_behind.setData(*_nan_join([_to_sd(gt, p) for p in behind_xy]))
                 self.sd_ellipses.setData(*_nan_join([_to_sd(gt, p) for p in ellipses]))
@@ -1571,30 +2034,92 @@ def _install_widgets() -> None:
             item.setRect(QtCore.QRectF(float(origin_x), float(origin_y), w * resolution, h * resolution))
             item.show()
 
+        def _flow_sample(self, pred):
+            if pred is None:
+                return None
+            raw = getattr(pred, "occupancy_flow", None)
+            if raw is None:
+                return None
+            grid = None
+            if isinstance(raw, dict):
+                for steps in raw.values():
+                    if steps:
+                        grid = np.asarray(steps[-1], dtype=float)
+                        break
+            else:
+                try:
+                    if len(raw):
+                        grid = np.asarray(raw[-1], dtype=float)
+                except TypeError:
+                    return None
+            if grid is None or grid.size == 0:
+                return None
+            flat = grid.reshape(-1)
+            return (grid.shape, round(float(flat[::max(1, flat.size // 8)].sum()), 4))
+
+        def _flow_lut(self):
+            if self._flow_lut_cache is not None:
+                return self._flow_lut_cache
+            lut = np.zeros((256, 4), dtype=np.ubyte)
+            ramp = np.arange(256, dtype=np.ubyte)
+            lut[:, 0] = ramp
+            lut[:, 1] = ramp // 3
+            lut[:, 2] = 255 - ramp
+            lut[:, 3] = np.where(ramp > 8, 160, 0).astype(np.ubyte)
+            self._flow_lut_cache = lut
+            return lut
+
         def _paint_occupancy(self, stack, s) -> None:
             pm = stack.pm
-            show_map = bool(s.p67_show_occupancy_map.get())
+            show_map = bool(s.p67_show_occupancy_map.get()) and self._xy_on
             om = _occupancy_grid(pm) if show_map else None
             if om is not None:
-                self._set_image(self.xy_occ, om.grid, om.origin_x, om.origin_y, float(om.resolution or 0.25))
-                self.layer_point_counts["occupancy"] = int(np.size(om.grid))
+                grid = np.asarray(om.grid)
+                flat = grid.reshape(-1)
+                token = (
+                    grid.shape,
+                    round(float(flat[::max(1, flat.size // 16)].sum()), 5),
+                    round(float(om.origin_x), 3),
+                    round(float(om.origin_y), 3),
+                    float(om.resolution or 0.25),
+                )
+                if self._curve_cache.get("occ") != token:
+                    self._curve_cache["occ"] = token
+                    self._set_image(
+                        self.xy_occ, om.grid, om.origin_x, om.origin_y, float(om.resolution or 0.25),
+                    )
+                self.layer_point_counts["occupancy"] = int(grid.size)
             else:
-                self.xy_occ.hide()
+                if self._curve_cache.get("occ") != 0:
+                    self.xy_occ.hide()
+                    self._curve_cache["occ"] = 0
                 self.layer_point_counts["occupancy"] = 0
-            flow = _flow_image(getattr(pm, "prediction", None)) if s.p67_show_prediction.get() else None
-            if flow is not None:
-                grid, (ox, oy, res) = flow
-                lut = np.zeros((256, 4), dtype=np.ubyte)
-                ramp = np.arange(256, dtype=np.ubyte)
-                lut[:, 0] = ramp
-                lut[:, 1] = (ramp // 3)
-                lut[:, 2] = 255 - ramp
-                lut[:, 3] = np.where(ramp > 8, 160, 0).astype(np.ubyte)
-                self._set_image(self.xy_flow, grid, ox, oy, res, lut)
-                self.layer_point_counts["occupancy_flow"] = int(np.count_nonzero(grid > 0.02))
-            else:
+            if not (s.p67_show_prediction.get() and self._xy_on):
+                if self._curve_cache.get("flow") != 0:
+                    self.xy_flow.hide()
+                    self._curve_cache["flow"] = 0
+                    self.layer_point_counts["occupancy_flow"] = 0
+                return
+            pred = getattr(pm, "prediction", None)
+            sample = self._flow_sample(pred)
+            if sample is None:
+                if self._curve_cache.get("flow") != 0:
+                    self.xy_flow.hide()
+                    self._curve_cache["flow"] = 0
+                    self.layer_point_counts["occupancy_flow"] = 0
+                return
+            if self._curve_cache.get("flow") == sample:
+                return
+            flow = _flow_image(pred)
+            if flow is None:
                 self.xy_flow.hide()
+                self._curve_cache["flow"] = sample
                 self.layer_point_counts["occupancy_flow"] = 0
+                return
+            grid, (ox, oy, res) = flow
+            self._curve_cache["flow"] = sample
+            self._set_image(self.xy_flow, grid, ox, oy, res, self._flow_lut())
+            self.layer_point_counts["occupancy_flow"] = int(np.count_nonzero(grid > 0.02))
 
         def _hide_ruler(self) -> None:
             self.xy_ruler.setData([], [])

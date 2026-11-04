@@ -94,8 +94,10 @@ class VisualizerQtWindow:
         self.win.keyReleaseEvent = self._key_release_event  # type: ignore[method-assign]
         self._install_key_filter()
 
+        self._in_ui_update = False
+        self._last_plot_t = 0.0
         self._ui_timer = QtCore.QTimer(self.win)
-        self._ui_timer.timeout.connect(self.update_ui)
+        self._ui_timer.timeout.connect(self._on_ui_timer)
         hz = max(5.0, float(self.setting.p60_ui_refresh_hz))
         self._ui_timer.start(int(1000 / hz))
 
@@ -557,15 +559,33 @@ class VisualizerQtWindow:
     def local_plan_view_enabled(self) -> bool:
         return self.setting.local_plan_view_enabled()
 
-    def update_ui(self) -> None:
-        if self.exec is None:
+    def _on_ui_timer(self) -> None:
+        """Timer path. Plots are capped at 30 Hz; readouts still follow the timer."""
+        self.update_ui(throttle=True)
+
+    def update_ui(self, throttle: bool = False) -> None:
+        if self.exec is None or self._in_ui_update:
             return
+        self._in_ui_update = True
+        try:
+            self._update_ui_body(throttle)
+        finally:
+            self._in_ui_update = False
+
+    def _update_ui_body(self, throttle: bool) -> None:
         t0 = time.perf_counter()
-        latency = 0.0
-        if self.setting.p67_global_plan_view.get():
-            latency += self.global_plot.redraw()
-        if self.setting.local_plan_view_enabled():
-            latency += self.local_plot.redraw()
+        # Tk caps plot redraws at ~30 Hz (p61 update_ui) and, while the executor
+        # is running, only polls the UI at 20 Hz. Direct calls (tests, mouse)
+        # still redraw immediately.
+        do_plot = (not throttle) or (t0 - self._last_plot_t) >= (1.0 / 30.0)
+        if do_plot:
+            latency = 0.0
+            if self.setting.p67_global_plan_view.get():
+                latency += self.global_plot.redraw()
+            if self.setting.local_plan_view_enabled():
+                latency += self.local_plot.redraw()
+            self._last_plot_t = t0
+            self.setting.plot_latency_ms.set(f"{latency:7.1f}")
 
         ego = self.exec.ego_state
         # Fixed field widths: proportional digits used to change QLabel size hints
@@ -589,7 +609,6 @@ class VisualizerQtWindow:
         self.setting.replan_fps.set(f"{self.exec.planner_fps:7.1f}")
         self.setting.control_fps.set(f"{self.exec.control_fps:7.1f}")
         self.setting.perception_fps.set(f"{self.exec.perception_fps:7.1f}")
-        self.setting.plot_latency_ms.set(f"{latency:7.1f}")
 
         self._ui_frames += 1
         elapsed = time.perf_counter() - self._ui_t0
@@ -597,7 +616,8 @@ class VisualizerQtWindow:
             self.setting.ui_fps.set(f"{self._ui_frames / elapsed:7.1f}")
             self._ui_frames = 0
             self._ui_t0 = time.perf_counter()
-        log.debug("UI update %.2f ms (plot %.2f)", (time.perf_counter() - t0) * 1000, latency)
+        if do_plot:
+            log.debug("UI update %.2f ms (plot %.2f)", (time.perf_counter() - t0) * 1000, latency)
 
     def apply_global_plan(
         self, global_plan: GlobalPlan, ego_xy: Optional[tuple[float, float]] = None

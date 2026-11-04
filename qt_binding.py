@@ -42,8 +42,11 @@ def import_pyqtgraph(*, use_opengl: bool | None = None):
 
     if use_opengl is None:
         use_opengl = os.environ.get("AVLITE_QT_NO_OPENGL") != "1"
+    # Software antialiasing rasterizes every segment on the CPU when OpenGL is
+    # off (the Xvfb / test path). Static layers are cached; leave AA off so a
+    # camera pan does not restroke the whole lap.
     pg.setConfigOptions(
-        antialias=True,
+        antialias=False,
         background="#1e1e1e",
         foreground="#dddddd",
         useOpenGL=bool(use_opengl),
