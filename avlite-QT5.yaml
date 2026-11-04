@@ -1,0 +1,19 @@
+# Recommended profile. Filename matches the registry id ``avlite-QT5``.
+c69_apps:
+  c62_load_plugins: true
+  c62_community_plugins:
+    avlite-QT5: avlite-QT5
+c40_execution:
+  c40_bridge: BasicSim
+  c40_controller: StanleyController
+  c40_executer_type: AsyncThreadedExecuter
+  c40_global_planner: GlobalCenterlineRacePlanner
+  c40_local_planner: ShortestPathLatticePlanner
+  c40_perception: PerceptionPipeline
+  c40_pace_sim: false
+  c40_sim_dt: 0.05
+plugins:
+  avlite-QT5:
+    p60_dark_mode: true
+    p60_ui_refresh_hz: 60.0
+    p60_use_opengl: true
