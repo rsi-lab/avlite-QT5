@@ -18,6 +18,42 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def pin_readout(label, sample: str) -> None:
+    """Lock a numeric label to one monospace width so digit changes cannot reflow."""
+    from .qt_binding import import_qt
+
+    QtCore, QtGui, QtWidgets = import_qt()
+    font = QtGui.QFont("monospace")
+    font.setStyleHint(QtGui.QFont.TypeWriter)
+    font.setFixedPitch(True)
+    font.setPointSize(10)
+    label.setFont(font)
+    metrics = QtGui.QFontMetrics(font)
+    advance = metrics.horizontalAdvance(sample) if hasattr(metrics, "horizontalAdvance") else metrics.width(sample)
+    label.setFixedWidth(int(advance) + 8)
+    label.setFixedHeight(metrics.height() + 4)
+    label.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+    label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+
+def pin_fluid_readout(label) -> None:
+    """Monospace line that fills its cell and cannot change the layout's minimum size."""
+    from .qt_binding import import_qt
+
+    QtCore, QtGui, QtWidgets = import_qt()
+    font = QtGui.QFont("monospace")
+    font.setStyleHint(QtGui.QFont.TypeWriter)
+    font.setFixedPitch(True)
+    font.setPointSize(10)
+    label.setFont(font)
+    label.setWordWrap(False)
+    metrics = QtGui.QFontMetrics(font)
+    label.setFixedHeight(metrics.height() + 4)
+    label.setMinimumWidth(0)
+    label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+    label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+
 def _combo(parent, var: Var, choices: list[str], on_change: Callable[[], None] | None = None) -> QtWidgets.QComboBox:
     box = QtWidgets.QComboBox(parent)
     box.addItems([str(c) for c in choices])
@@ -101,6 +137,8 @@ def _install_panels() -> None:
             row.addWidget(self.control, 1)
             layout.addLayout(row)
 
+            layout.addWidget(self.perception.state_lbl)
+
             self.execution = ExecutionPanel(root)
             layout.addWidget(self.execution)
 
@@ -144,9 +182,12 @@ def _install_panels() -> None:
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
             grid.addWidget(self.loc, 5, 1)
+            # Full-width placement happens in StackPanels. Keeping it in this
+            # column made the monospace line clip, and letting it grow moved the panel.
             self.state_lbl = QtWidgets.QLabel()
+            self.state_lbl.setObjectName("egoState")
             self.state_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            grid.addWidget(self.state_lbl, 6, 0, 1, 2)
+            pin_fluid_readout(self.state_lbl)
             root.setting.vehicle_state.bind(lambda: self.state_lbl.setText(str(root.setting.vehicle_state.get())))
             self._update_pipeline_enabled()
 
@@ -220,14 +261,18 @@ def _install_panels() -> None:
             save_occ = QtWidgets.QPushButton("Save occupancy")
             save_occ.clicked.connect(lambda: root.save_occupancy_map())
             grid.addWidget(save_occ, 5, 2)
-            self.wp_lbl = QtWidgets.QLabel("WP: 0   Lap: 0")
+            self.wp_lbl = QtWidgets.QLabel("WP:      0   Lap:      0")
+            self.wp_lbl.setObjectName("wpLap")
+            pin_readout(self.wp_lbl, "WP: 999999   Lap: 999999")
             grid.addWidget(self.wp_lbl, 6, 0, 1, 3)
             root.setting.current_wp.bind(self._update_wp)
             root.setting.lap.bind(self._update_wp)
             self.refresh()
 
         def _update_wp(self) -> None:
-            self.wp_lbl.setText(f"WP: {self.root.setting.current_wp.get()}   Lap: {self.root.setting.lap.get()}")
+            wp = str(self.root.setting.current_wp.get()).strip()
+            lap = str(self.root.setting.lap.get()).strip()
+            self.wp_lbl.setText(f"WP: {wp:>6}   Lap: {lap:>6}")
 
         def _local_replan(self) -> None:
             if self.root.exec is None or self.root.exec.local_planner is None:
@@ -278,11 +323,17 @@ def _install_panels() -> None:
             )
             grid.addWidget(self.ctrl, 0, 1, 1, 2)
             self.gauges = {
-                "vel_cte": QtWidgets.QLabel("Vel CTE: 0.00"),
-                "pos_cte": QtWidgets.QLabel("Pos CTE: 0.00"),
-                "accel": QtWidgets.QLabel("Accel: 0.00"),
-                "steer": QtWidgets.QLabel("Steer: 0.00"),
+                "vel_cte": QtWidgets.QLabel("Vel CTE:    +0.00"),
+                "pos_cte": QtWidgets.QLabel("Pos CTE:    +0.00"),
+                "accel": QtWidgets.QLabel("Accel:      +0.00"),
+                "steer": QtWidgets.QLabel("Steer:      +0.00"),
             }
+            pin_readout(self.gauges["vel_cte"], "Vel CTE: -9999.99")
+            pin_readout(self.gauges["pos_cte"], "Pos CTE: -9999.99")
+            pin_readout(self.gauges["accel"], "Accel:   -9999.99")
+            pin_readout(self.gauges["steer"], "Steer:   -9999.99")
+            for name, gauge in self.gauges.items():
+                gauge.setObjectName(f"gauge_{name}")
             grid.addWidget(self.gauges["vel_cte"], 1, 0)
             grid.addWidget(self.gauges["pos_cte"], 1, 1)
             grid.addWidget(self.gauges["accel"], 2, 0)
@@ -307,10 +358,10 @@ def _install_panels() -> None:
 
         def _update_gauges(self) -> None:
             s = self.root.setting
-            self.gauges["vel_cte"].setText(f"Vel CTE: {float(s.cte_vel.get()):.2f}")
-            self.gauges["pos_cte"].setText(f"Pos CTE: {float(s.cte_steer.get()):.2f}")
-            self.gauges["accel"].setText(f"Accel: {float(s.cmd_accel.get()):.2f}")
-            self.gauges["steer"].setText(f"Steer: {float(s.cmd_steer.get()):.2f}")
+            self.gauges["vel_cte"].setText(f"Vel CTE: {float(s.cte_vel.get()):+9.2f}")
+            self.gauges["pos_cte"].setText(f"Pos CTE: {float(s.cte_steer.get()):+9.2f}")
+            self.gauges["accel"].setText(f"Accel:   {float(s.cmd_accel.get()):+9.2f}")
+            self.gauges["steer"].setText(f"Steer:   {float(s.cmd_steer.get()):+9.2f}")
 
         def _drive(self, accel: float, steer: float) -> None:
             if self.root.exec is None:
@@ -410,11 +461,14 @@ def _install_panels() -> None:
             btns.addWidget(save_start)
             v.addLayout(btns)
             self.cap_label = QtWidgets.QLabel("caps: —")
-            self.cap_label.setWordWrap(True)
+            self.cap_label.setObjectName("capLabel")
+            pin_fluid_readout(self.cap_label)
             v.addWidget(self.cap_label)
 
             stats = QtWidgets.QHBoxLayout()
-            self.stats_lbl = QtWidgets.QLabel("real=0  sim=0  perc=0  plan=0  ctrl=0  ui=0  plot=0ms")
+            self.stats_lbl = QtWidgets.QLabel("real=    0.00  sim=    0.00  perc=    0.0  plan=    0.0  ctrl=    0.0  ui=    0.0 Hz  plot=    0.0 ms")
+            self.stats_lbl.setObjectName("execStats")
+            pin_fluid_readout(self.stats_lbl)
             stats.addWidget(self.stats_lbl, 1)
             v.addLayout(stats)
             for var in (

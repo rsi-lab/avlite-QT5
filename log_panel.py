@@ -115,9 +115,14 @@ def _install_log() -> None:
                 "QTextEdit { background: #101410; color: #b6f5b6; "
                 "selection-background-color: #345c34; }"
             )
-            self.view.setMinimumHeight(140)
+            # Always-on vertical bar: AsNeeded appears once the log fills and
+            # steals width, which rewraps lines and flickers the pane.
+            self.view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+            self.view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self.view.setFixedHeight(140)
+            self.view.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             outer.addWidget(self.view, 1)
-            self.setMinimumHeight(210)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
             self._handler = _QtLogHandler(self)
             self._handler.setFormatter(
@@ -294,10 +299,10 @@ def _install_log() -> None:
             expanded = not bool(self.root.setting.p68_log_view_expanded.get())
             self.root.setting.p68_log_view_expanded.set(expanded)
             if expanded:
-                self.view.setMinimumHeight(320)
+                self.view.setFixedHeight(320)
                 self._expand_btn.setText("▾")
             else:
-                self.view.setMinimumHeight(140)
+                self.view.setFixedHeight(140)
                 self._expand_btn.setText("▴")
 
         def copy_log(self) -> None:

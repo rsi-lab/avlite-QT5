@@ -61,6 +61,7 @@ class VisualizerQtWindow:
         from .plot_widgets import GlobalPlotWidget, LocalPlotWidget
 
         self.plots_splitter = QtWidgets.QSplitter()
+        self.plots_splitter.setChildrenCollapsible(False)
         self.local_plot = LocalPlotWidget(self)
         self.global_plot = GlobalPlotWidget(self)
         self.plots_splitter.addWidget(self.local_plot)
@@ -419,13 +420,15 @@ class VisualizerQtWindow:
             latency += self.local_plot.redraw()
 
         ego = self.exec.ego_state
+        # Fixed field widths: proportional digits used to change QLabel size hints
+        # and grow the window whenever a value gained a character.
         self.setting.vehicle_state.set(
-            f"Loc: ({ego.x:+7.2f}, {ego.y:+7.2f}), Vel: {ego.velocity:5.2f} "
-            f"({ego.velocity * 3.6:6.2f} km/h), θ: {ego.theta:+5.1f}"
+            f"Loc: ({ego.x:+11.2f}, {ego.y:+11.2f}), Vel: {ego.velocity:8.2f} "
+            f"({ego.velocity * 3.6:8.2f} km/h), θ: {ego.theta:+7.1f}"
         )
         if self.exec.local_planner is not None:
-            self.setting.current_wp.set(str(self.exec.local_planner.global_trajectory.current_wp))
-            self.setting.lap.set(f"{self.exec.local_planner.lap:5d}")
+            self.setting.current_wp.set(f"{int(self.exec.local_planner.global_trajectory.current_wp):6d}")
+            self.setting.lap.set(f"{int(self.exec.local_planner.lap):6d}")
         if self.exec.controller is not None:
             self.setting.cte_vel.set(float(getattr(self.exec.controller, "cte_velocity", 0.0) or 0.0))
             self.setting.cte_steer.set(float(getattr(self.exec.controller, "cte_steer", 0.0) or 0.0))
@@ -433,17 +436,17 @@ class VisualizerQtWindow:
             if cmd is not None:
                 self.setting.cmd_accel.set(float(getattr(cmd, "acceleration", 0.0) or 0.0))
                 self.setting.cmd_steer.set(float(getattr(cmd, "steer", 0.0) or 0.0))
-        self.setting.elapsed_real_time.set(f"{self.exec.elapsed_real_time:6.2f}")
-        self.setting.elapsed_sim_time.set(f"{self.exec.elapsed_sim_time:6.2f}")
-        self.setting.replan_fps.set(f"{self.exec.planner_fps:6.1f}")
-        self.setting.control_fps.set(f"{self.exec.control_fps:6.1f}")
-        self.setting.perception_fps.set(f"{self.exec.perception_fps:6.1f}")
-        self.setting.plot_latency_ms.set(f"{latency:5.1f}")
+        self.setting.elapsed_real_time.set(f"{self.exec.elapsed_real_time:8.2f}")
+        self.setting.elapsed_sim_time.set(f"{self.exec.elapsed_sim_time:8.2f}")
+        self.setting.replan_fps.set(f"{self.exec.planner_fps:7.1f}")
+        self.setting.control_fps.set(f"{self.exec.control_fps:7.1f}")
+        self.setting.perception_fps.set(f"{self.exec.perception_fps:7.1f}")
+        self.setting.plot_latency_ms.set(f"{latency:7.1f}")
 
         self._ui_frames += 1
         elapsed = time.perf_counter() - self._ui_t0
         if elapsed >= 0.5:
-            self.setting.ui_fps.set(f"{self._ui_frames / elapsed:5.1f}")
+            self.setting.ui_fps.set(f"{self._ui_frames / elapsed:7.1f}")
             self._ui_frames = 0
             self._ui_t0 = time.perf_counter()
         log.debug("UI update %.2f ms (plot %.2f)", (time.perf_counter() - t0) * 1000, latency)

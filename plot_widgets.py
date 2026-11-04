@@ -47,6 +47,63 @@ def _agent_list(pm) -> list:
         return list(vehicles)
     return list(getattr(pm, "agents", []) or [])
 
+
+def _pin_plot_chrome(plot) -> None:
+    """Freeze axis pixels and turn off auto-range.
+
+    pyqtgraph's AxisItem grows and shrinks with the current tick strings
+    (``autoExpandTextSpace`` / ``autoReduceTextSpace``). That changes the
+    ViewBox width by tens of pixels, which changes a locked aspect ratio and
+    the PlotWidget size hint. The hint feeds the window minimum, so the whole
+    window jumps when coordinates gain a digit. A fixed axis size breaks the loop.
+    """
+    if getattr(plot, "_avlite_chrome_pinned", False):
+        return
+    plot.hideButtons()
+    plot.disableAutoRange()
+    plot.setAspectLocked(False)
+    for side in ("left", "bottom"):
+        axis = plot.getAxis(side)
+        axis.enableAutoSIPrefix(False)
+        axis.setStyle(autoExpandTextSpace=False, autoReduceTextSpace=False)
+        if side == "left":
+            axis.setWidth(78)
+        else:
+            axis.setHeight(44)
+    if plot.width() > 0:
+        plot._avlite_chrome_pinned = True
+
+
+def _set_equal_view(plot, cx: float, cy: float, half_x: float) -> None:
+    """Pan to ``(cx, cy)`` at a constant scale. No auto-range.
+
+    The pixel aspect is cached for the current widget size so a 1px axis
+    tweak cannot change the zoom. Following the ego still updates the center.
+    """
+    _pin_plot_chrome(plot)
+    vb = plot.getViewBox()
+    widget_wh = (int(plot.width()), int(plot.height()))
+    cached = getattr(plot, "_avlite_aspect", None)
+    if cached is None or cached[0] != widget_wh:
+        rect = vb.boundingRect()
+        w = int(rect.width())
+        h = int(rect.height())
+        if w < 2 or h < 2:
+            w = max(widget_wh[0], 1)
+            h = max(widget_wh[1], 1)
+        aspect = max(w / float(max(h, 1)), 0.25)
+        plot._avlite_aspect = (widget_wh, aspect)
+    else:
+        aspect = cached[1]
+    half_x = float(half_x)
+    half_y = half_x / aspect
+    plot.setRange(
+        xRange=(float(cx) - half_x, float(cx) + half_x),
+        yRange=(float(cy) - half_y, float(cy) + half_y),
+        padding=0.0,
+        disableAutoRange=True,
+    )
+
 _WIDGETS_READY = False
 
 
@@ -71,7 +128,6 @@ def _install_widgets() -> None:
             self.setLabel("bottom", "x (m)")
             self.setLabel("left", "y (m)")
             self.showGrid(x=True, y=True, alpha=0.25)
-            self.setAspectLocked(True)
             self._center_delta = np.array([0.0, 0.0])
             self._map_bounds: Optional[tuple[float, float, float, float]] = None
             self._drag_pan = False
@@ -101,6 +157,7 @@ def _install_widgets() -> None:
             from .plot_input import attach_plot_mouse
 
             attach_plot_mouse(self, self)
+            _pin_plot_chrome(self)
 
             self._last_draw_ms = 0.0
             self._fps = 0.0
@@ -139,7 +196,7 @@ def _install_widgets() -> None:
             if self.root.exec is None:
                 return
             x, y = self._xy(pos)
-            self._status(f"Teleport {x:.1f},{y:.1f}")
+            self._status(f"Teleport {x:+9.1f},{y:+9.1f}")
             if button == QtCore.Qt.LeftButton:
                 self._left_press_time = time.time()
                 if self._ctrl(modifiers):
@@ -158,7 +215,7 @@ def _install_widgets() -> None:
         def on_move(self, pos, buttons, modifiers) -> None:
             x, y = self._xy(pos)
             if not buttons:
-                self._status(f"Teleport {x:.1f},{y:.1f}")
+                self._status(f"Teleport {x:+9.1f},{y:+9.1f}")
                 self._on_mouse_moved(pos)
                 return
             if self.root.exec is None:
@@ -387,7 +444,7 @@ def _install_widgets() -> None:
                 else:
                     self.past_path.setData([], [])
 
-            # View window
+            # View window. One explicit range; axis pixels stay fixed (see _pin_plot_chrome).
             zoom = float(setting.p66_global_zoom)
             cx = ego.x + self._center_delta[0]
             cy = ego.y + self._center_delta[1]
@@ -395,9 +452,7 @@ def _install_widgets() -> None:
                 loc = getattr(stack.local_planner, "location_xy", None)
                 if loc is not None:
                     cx, cy = float(loc[0]), float(loc[1])
-            self.setXRange(cx - zoom, cx + zoom, padding=0)
-            aspect = max(self.width() / max(self.height(), 1), 0.25)
-            self.setYRange(cy - zoom / aspect, cy + zoom / aspect, padding=0)
+            _set_equal_view(self, cx, cy, zoom)
 
             dt_ms = (time.perf_counter() - t0) * 1000.0
             self._last_draw_ms = dt_ms
@@ -429,7 +484,7 @@ def _install_widgets() -> None:
                 pw.setLabel("bottom", xlabel)
                 pw.setLabel("left", ylabel)
                 pw.showGrid(x=True, y=True, alpha=0.25)
-                pw.setAspectLocked(True)
+                _pin_plot_chrome(pw)
             layout.addWidget(self.xy_plot, 1)
             layout.addWidget(self.frenet_plot, 1)
 
@@ -539,7 +594,9 @@ def _install_widgets() -> None:
             if self.root.exec is None:
                 return
             if not buttons:
-                self._status(f"Spawn {x:.1f},{y:.1f}" if not frenet else f"Spawn S:{x:.1f},D:{y:.1f}")
+                self._status(
+                    f"Spawn S:{x:+9.1f},D:{y:+9.1f}" if frenet else f"Spawn {x:+9.1f},{y:+9.1f}"
+                )
                 self._update_ruler(x, y, frenet=frenet)
                 return
             self._hide_ruler()
@@ -587,7 +644,7 @@ def _install_widgets() -> None:
             self.root.teleport_ego(wx, wy)
             self._step_local()
             self.root.update_ui()
-            self._status(f"Spawn {wx:.1f},{wy:.1f}")
+            self._status(f"Spawn {wx:+9.1f},{wy:+9.1f}")
 
         def _left_drag(self, x: float, y: float, *, frenet: bool) -> None:
             wx, wy, ax, ay, was_frenet = self._left_anchor
@@ -611,10 +668,10 @@ def _install_widgets() -> None:
             if frenet:
                 traj = self.root.exec.local_planner.global_plan.trajectory
                 wx, wy = traj.convert_sd_to_xy(x, y)
-                self._status(f"Spawn S:{x:.1f},D:{y:.1f}")
+                self._status(f"Spawn S:{x:+9.1f},D:{y:+9.1f}")
             else:
                 wx, wy = x, y
-                self._status(f"Spawn {x:.1f},{y:.1f}")
+                self._status(f"Spawn {x:+9.1f},{y:+9.1f}")
             agent = AgentState(x=float(wx), y=float(wy), theta=float(ego.theta), velocity=0)
             self.root.spawn_agent(agent)
             self._spawn_agent = agent
@@ -791,16 +848,14 @@ def _install_widgets() -> None:
             else:
                 self.xy_pred.setData([], [])
 
-            # View windows
+            # View windows. Equal scale from the pinned view box, not auto-range.
             zoom = float(s.p66_xy_zoom)
             cx, cy = ego.x, ego.y
             if s.p66_global_view_follow_planner.get() and lp is not None:
                 loc = getattr(lp, "location_xy", None)
                 if loc is not None:
                     cx, cy = float(loc[0]), float(loc[1])
-            self.xy_plot.setXRange(cx - zoom, cx + zoom, padding=0)
-            aspect = max(self.xy_plot.width() / max(self.xy_plot.height(), 1), 0.25)
-            self.xy_plot.setYRange(cy - zoom / aspect, cy + zoom / aspect, padding=0)
+            _set_equal_view(self.xy_plot, cx, cy, zoom)
 
             fzoom = float(s.p66_frenet_zoom)
             if gt is not None:
@@ -811,8 +866,7 @@ def _install_widgets() -> None:
                     cs, cd = 0.0, 0.0
             else:
                 cs, cd = 0.0, 0.0
-            self.frenet_plot.setXRange(cs - fzoom, cs + fzoom, padding=0)
-            self.frenet_plot.setYRange(cd - fzoom / 2, cd + fzoom / 2, padding=0)
+            _set_equal_view(self.frenet_plot, cs, cd, fzoom)
 
             self._last_draw_ms = (time.perf_counter() - t0) * 1000.0
             return self._last_draw_ms

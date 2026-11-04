@@ -36,6 +36,7 @@ def _install() -> None:
         def __init__(self, root: "VisualizerQtWindow"):
             super().__init__("Settings")
             self.setObjectName("configBar")
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             self.root = root
             self._syncing = False
 
@@ -60,7 +61,9 @@ def _install() -> None:
 
             self.status = QtWidgets.QLabel("Click plot")
             self.status.setObjectName("plotStatus")
-            self.status.setMinimumWidth(140)
+            from .stack_panels import pin_readout
+
+            pin_readout(self.status, "Teleport -123456.7,-123456.7")
             row.addWidget(self.status)
             row.addStretch(1)
 
