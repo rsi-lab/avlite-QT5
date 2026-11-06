@@ -118,9 +118,11 @@ Not identical to Tk (called out so the checklist stays honest):
 
 ## Screenshots
 
-Offscreen renders against BasicSim (Yas Marina):
+Live BasicSim / Yas Marina shots (UI ~60 Hz, km/h speed dial):
 
 ![Main window](docs/qt_visualizer_main.png)
+
+![Control panel](docs/qt_visualizer_control_panel.png)
 
 ![Shortcut mode](docs/qt_visualizer_shortcut_mode.png)
 
