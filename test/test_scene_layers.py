@@ -100,6 +100,48 @@ def test_capability_checks_filter_world_sensors(window):
         ExecutionSettings.c41_world_stack_capabilities = None
 
 
+def test_control_readouts_keep_their_instruments(window, qapp):
+    """CTE bars sit on their numbers. Steer is a wheel and speed is a dial."""
+    window._ui_timer.stop()
+    window.show()
+    qapp.processEvents()
+    control = window.stack_panels.control
+
+    def _placed(label_name: str, instrument_name: str):
+        label = control.gauges[label_name]
+        instrument = window.win.findChild(window.QtWidgets.QWidget, instrument_name)
+        assert instrument is not None and instrument.isVisible()
+        origin = label.mapTo(control, label.rect().topLeft())
+        label_box = window.QtCore.QRect(origin, label.size())
+        inst_origin = instrument.mapTo(control, instrument.rect().topLeft())
+        inst_box = window.QtCore.QRect(inst_origin, instrument.size())
+        return label_box, inst_box
+
+    for label_name, instrument_name in (
+        ("vel_cte", "valueGauge_vel_cte"),
+        ("pos_cte", "valueGauge_pos_cte"),
+    ):
+        label_box, bar_box = _placed(label_name, instrument_name)
+        assert abs(bar_box.left() - label_box.left()) <= 2, (label_name, label_box, bar_box)
+        assert 0 <= bar_box.top() - label_box.bottom() <= 8, (label_name, label_box, bar_box)
+        assert bar_box.width() >= label_box.width(), (label_name, label_box, bar_box)
+
+    for label_name, instrument_name in (("accel", "speedGauge"), ("steer", "steerWheel")):
+        label_box, inst_box = _placed(label_name, instrument_name)
+        assert 0 <= inst_box.top() - label_box.bottom() <= 8, (label_name, label_box, inst_box)
+        assert inst_box.left() <= label_box.right() and inst_box.right() >= label_box.left()
+
+    assert window.win.findChild(window.QtWidgets.QWidget, "valueGauge_steer") is None
+    assert window.win.findChild(window.QtWidgets.QWidget, "valueGauge_accel") is None
+    window.setting.cmd_steer.set(0.35)
+    assert window.win.findChild(window.QtWidgets.QWidget, "steerWheel")._steer == 0.35
+    window.exec.ego_state.velocity = 12.5
+    window.setting.vehicle_state.set("speed-check")
+    assert window.win.findChild(window.QtWidgets.QWidget, "speedGauge")._speed == 12.5
+    assert "Accel" in control.gauges["accel"].text()
+    assert "Steer" in control.gauges["steer"].text()
+
+
 def test_schema_settings_and_plugin_browser_build(window, qapp):
     from avlite.c10_perception.c19_settings import PerceptionSettings
     from avlite.plugins.avlite_QT5.plugin_browser import _Browser

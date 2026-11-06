@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Callable
 
 from avlite.c10_perception.c12_perception_strategy import PerceptionPipeline
@@ -350,15 +351,40 @@ def _install_panels() -> None:
                 w.setEnabled(pipe)
 
 
+    def _meter_palette(widget) -> dict:
+        """Colors taken from the visualizer theme so instruments match the panels."""
+        dark = widget.palette().color(QtGui.QPalette.Window).lightness() < 140
+        if dark:
+            return {
+                "face": QtGui.QColor("#1e1e1e"),
+                "track": QtGui.QColor("#3a3a3a"),
+                "rim": QtGui.QColor("#8d8d8d"),
+                "ink": QtGui.QColor("#dddddd"),
+                "muted": QtGui.QColor("#8a8a8a"),
+                "accent": QtGui.QColor("#6abf69"),
+                "neg": QtGui.QColor("#e07a7a"),
+                "edge": QtGui.QColor("#555555"),
+            }
+        return {
+            "face": QtGui.QColor("#f7f7f7"),
+            "track": QtGui.QColor("#d5d5d5"),
+            "rim": QtGui.QColor("#555555"),
+            "ink": QtGui.QColor("#222222"),
+            "muted": QtGui.QColor("#666666"),
+            "accent": QtGui.QColor("#2e7d32"),
+            "neg": QtGui.QColor("#c62828"),
+            "edge": QtGui.QColor("#bbbbbb"),
+        }
+
     class ValueGauge(QtWidgets.QWidget):
-        """Horizontal meter matching the Tk ValueGauge (value inside min/max)."""
+        """Zero-centered bar for a signed readout. ``_value`` is the raw reading."""
 
         def __init__(self, lo: float, hi: float, parent=None):
             super().__init__(parent)
             self._lo = float(lo)
             self._hi = float(hi)
             self._value = 0.0
-            self.setFixedHeight(10)
+            self.setFixedHeight(14)
             self.setMinimumWidth(48)
             self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
@@ -368,28 +394,189 @@ def _install_panels() -> None:
 
         def paintEvent(self, _event) -> None:  # noqa: N802
             painter = QtGui.QPainter(self)
-            painter.fillRect(self.rect(), QtGui.QColor("#2b2b2b"))
+            colors = _meter_palette(self)
+            painter.fillRect(self.rect(), colors["track"])
             span = self._hi - self._lo
             if span == 0:
                 return
-            frac = max(0.0, min(1.0, (self._value - self._lo) / span))
-            painter.fillRect(0, 0, int(self.width() * frac), self.height(), QtGui.QColor("#6abf69"))
+            shown = max(self._lo, min(self._hi, self._value))
+            if self._lo < 0.0 < self._hi:
+                zero = (0.0 - self._lo) / span * self.width()
+                x = (shown - self._lo) / span * self.width()
+                painter.fillRect(
+                    int(min(zero, x)),
+                    1,
+                    max(1, int(abs(x - zero))) if shown != 0.0 else 0,
+                    self.height() - 2,
+                    colors["accent"] if shown >= 0.0 else colors["neg"],
+                )
+                painter.setPen(colors["muted"])
+                painter.drawLine(int(round(zero)), 0, int(round(zero)), self.height())
+            else:
+                frac = max(0.0, min(1.0, (shown - self._lo) / span))
+                painter.fillRect(0, 1, int(self.width() * frac), self.height() - 2, colors["accent"])
+            painter.setPen(colors["edge"])
+            painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+
+    class SteeringWheel(QtWidgets.QWidget):
+        """Round wheel whose top mark rotates with the steer command."""
+
+        _SIZE = 84
+
+        def __init__(self, limit: float, parent=None):
+            super().__init__(parent)
+            self._limit = max(abs(float(limit)), 1e-3)
+            self._steer = 0.0
+            self.setFixedSize(self._SIZE, self._SIZE)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            self.setToolTip("Steer angle")
+
+        def setAngle(self, steer: float) -> None:
+            steer = float(steer)
+            if abs(steer - self._steer) < 1e-4:
+                return
+            self._steer = steer
+            self.update()
+
+        def paintEvent(self, _event) -> None:  # noqa: N802
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            colors = _meter_palette(self)
+            side = min(self.width(), self.height())
+            center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0 + 2.0)
+            radius = side / 2.0 - 8.0
+            painter.setPen(QtGui.QPen(colors["rim"], 6.0))
+            painter.setBrush(colors["face"])
+            painter.drawEllipse(center, radius, radius)
+
+            frac = max(-1.0, min(1.0, self._steer / self._limit))
+            painter.save()
+            painter.translate(center)
+            # Positive steer (the A key) is a left turn: rotate the wheel counterclockwise.
+            painter.rotate(-frac * 120.0)
+            painter.setPen(QtGui.QPen(colors["ink"], 2.4, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            inner = radius * 0.28
+            outer = radius - 7.0
+            for spoke in range(3):
+                painter.drawLine(QtCore.QPointF(0.0, inner), QtCore.QPointF(0.0, -outer))
+                painter.rotate(120.0)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(colors["accent"])
+            painter.drawRoundedRect(QtCore.QRectF(-3.5, -radius + 1.0, 7.0, 11.0), 2.0, 2.0)
+            painter.setBrush(colors["track"])
+            painter.setPen(QtGui.QPen(colors["rim"], 1.2))
+            painter.drawEllipse(QtCore.QPointF(0.0, 0.0), radius * 0.22, radius * 0.22)
+            painter.restore()
+
+            # Stationary housing mark so the rotation has a reference.
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(colors["muted"])
+            tip_y = center.y() - radius - 1.0
+            painter.drawPolygon(
+                QtGui.QPolygonF(
+                    [
+                        QtCore.QPointF(center.x() - 4.0, 1.0),
+                        QtCore.QPointF(center.x() + 4.0, 1.0),
+                        QtCore.QPointF(center.x(), tip_y if tip_y > 6.0 else 7.0),
+                    ]
+                )
+            )
+
+    class SpeedDial(QtWidgets.QWidget):
+        """Arc speedometer. The needle tracks ego speed; the number stays inside the dial."""
+
+        _SIZE = 84
+        _MAX_MPS = 40.0
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._speed = 0.0
+            self.setFixedSize(self._SIZE, self._SIZE)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            self.setToolTip("Speed (m/s)")
+
+        def setSpeed(self, mps: float) -> None:
+            mps = float(mps)
+            if abs(mps - self._speed) < 0.005:
+                return
+            self._speed = mps
+            self.update()
+
+        def paintEvent(self, _event) -> None:  # noqa: N802
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            colors = _meter_palette(self)
+            side = min(self.width(), self.height())
+            center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0 + 2.0)
+            radius = side / 2.0 - 8.0
+            painter.setPen(QtGui.QPen(colors["rim"], 1.5))
+            painter.setBrush(colors["face"])
+            painter.drawEllipse(center, radius, radius)
+
+            arc_r = radius - 8.0
+            arc = QtCore.QRectF(center.x() - arc_r, center.y() - arc_r, arc_r * 2.0, arc_r * 2.0)
+            start = 210 * 16
+            sweep = -240 * 16
+            painter.setPen(QtGui.QPen(colors["track"], 4.5, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.drawArc(arc, start, sweep)
+            shown = max(0.0, min(self._MAX_MPS, self._speed))
+            frac = shown / self._MAX_MPS
+            if frac > 0.0:
+                painter.setPen(QtGui.QPen(colors["accent"], 4.5, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+                painter.drawArc(arc, start, int(sweep * frac))
+
+            ang = math.radians(210.0 - 240.0 * frac)
+            # Needle stays outside the center numerals so the speed stays readable.
+            inner = 16.0
+            outer = arc_r - 1.0
+            painter.setPen(QtGui.QPen(colors["ink"], 2.0, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.drawLine(
+                QtCore.QPointF(center.x() + math.cos(ang) * inner, center.y() - math.sin(ang) * inner),
+                QtCore.QPointF(center.x() + math.cos(ang) * outer, center.y() - math.sin(ang) * outer),
+            )
+
+            font = QtGui.QFont("monospace")
+            font.setStyleHint(QtGui.QFont.TypeWriter)
+            font.setFixedPitch(True)
+            font.setPointSize(9)
+            painter.setFont(font)
+            painter.setPen(colors["neg"] if self._speed < 0.0 else colors["ink"])
+            painter.drawText(
+                QtCore.QRectF(center.x() - 24.0, center.y() - 10.0, 48.0, 14.0),
+                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+                f"{self._speed:.1f}",
+            )
+            font.setPointSize(7)
+            painter.setFont(font)
+            painter.setPen(colors["muted"])
+            painter.drawText(
+                QtCore.QRectF(center.x() - 24.0, center.y() + 4.0, 48.0, 11.0),
+                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
+                "m/s",
+            )
 
     class ControlPanel(QtWidgets.QGroupBox):
         def __init__(self, root: "VisualizerQtWindow"):
             super().__init__("Control")
             self.root = root
             grid = QtWidgets.QGridLayout(self)
+            grid.setContentsMargins(8, 8, 8, 6)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(8)
             choices = root.setting.registry_choices()
-            grid.addWidget(QtWidgets.QLabel("Controller"), 0, 0)
+            head = QtWidgets.QHBoxLayout()
+            head.setContentsMargins(0, 0, 0, 0)
+            head.setSpacing(6)
+            head.addWidget(QtWidgets.QLabel("Controller"))
             self.ctrl = _combo(
                 self, root.setting.controller_type, choices["controller"],
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
-            grid.addWidget(self.ctrl, 0, 1, 1, 2)
+            head.addWidget(self.ctrl, 1)
             from avlite.c30_control.c32_control_strategy import ControlStrategy
 
-            grid.addWidget(_info_button(self, self.ctrl, ControlStrategy.registry), 0, 3)
+            head.addWidget(_info_button(self, self.ctrl, ControlStrategy.registry))
+            grid.addLayout(head, 0, 0, 1, 2)
             self.gauges = {
                 "vel_cte": QtWidgets.QLabel("Vel CTE:    +0.00"),
                 "pos_cte": QtWidgets.QLabel("Pos CTE:    +0.00"),
@@ -402,11 +589,25 @@ def _install_panels() -> None:
             pin_readout(self.gauges["steer"], "Steer:   -9999.99")
             for name, gauge in self.gauges.items():
                 gauge.setObjectName(f"gauge_{name}")
-            grid.addWidget(self.gauges["vel_cte"], 1, 0)
-            grid.addWidget(self.gauges["pos_cte"], 1, 1)
-            grid.addWidget(self.gauges["accel"], 2, 0)
-            grid.addWidget(self.gauges["steer"], 2, 1)
+            from avlite.c30_control.c39_settings import ControlSettings
+
+            smax = float(getattr(ControlSettings, "c32_ego_max_steering", 0.7))
+            self.value_gauges = {
+                "vel_cte": ValueGauge(-10.0, 10.0),
+                "pos_cte": ValueGauge(-5.0, 5.0),
+            }
+            self.value_gauges["vel_cte"].setObjectName("valueGauge_vel_cte")
+            self.value_gauges["pos_cte"].setObjectName("valueGauge_pos_cte")
+            self.speed_dial = SpeedDial()
+            self.speed_dial.setObjectName("speedGauge")
+            self.steer_wheel = SteeringWheel(smax)
+            self.steer_wheel.setObjectName("steerWheel")
+            grid.addWidget(self._readout(self.gauges["vel_cte"], self.value_gauges["vel_cte"]), 1, 0)
+            grid.addWidget(self._readout(self.gauges["pos_cte"], self.value_gauges["pos_cte"]), 1, 1)
+            grid.addWidget(self._readout(self.gauges["accel"], self.speed_dial), 2, 0)
+            grid.addWidget(self._readout(self.gauges["steer"], self.steer_wheel), 2, 1)
             btn_row = QtWidgets.QHBoxLayout()
+            btn_row.setContentsMargins(0, 0, 0, 0)
             for label, slot in (
                 ("Step", self._step),
                 ("Align", self._align),
@@ -418,29 +619,35 @@ def _install_panels() -> None:
                 b = QtWidgets.QPushButton(label)
                 b.clicked.connect(slot)
                 btn_row.addWidget(b)
-            grid.addLayout(btn_row, 3, 0, 1, 3)
-            self.value_gauges = {}
-            from avlite.c30_control.c39_settings import ControlSettings
-
-            amin = float(getattr(ControlSettings, "c32_ego_min_acceleration", -20.0))
-            smax = float(getattr(ControlSettings, "c32_ego_max_steering", 0.7))
-            ranges = {
-                "vel_cte": (-10.0, 10.0),
-                "pos_cte": (-5.0, 5.0),
-                "accel": (amin, abs(amin)),
-                "steer": (-smax, smax),
-            }
-            for key, (row, col) in (
-                ("vel_cte", (4, 0)), ("pos_cte", (4, 1)), ("accel", (5, 0)), ("steer", (5, 1)),
-            ):
-                bar = ValueGauge(*ranges[key])
-                bar.setObjectName(f"valueGauge_{key}")
-                self.value_gauges[key] = bar
-                grid.addWidget(bar, row, col)
+            grid.addLayout(btn_row, 3, 0, 1, 2)
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+            grid.setRowStretch(4, 1)
             root.setting.cte_vel.bind(self._update_gauges)
             root.setting.cte_steer.bind(self._update_gauges)
             root.setting.cmd_accel.bind(self._update_gauges)
             root.setting.cmd_steer.bind(self._update_gauges)
+            root.setting.vehicle_state.bind(self._sync_speed)
+            self._update_gauges()
+            self._sync_speed()
+
+        @staticmethod
+        def _readout(label, instrument) -> QtWidgets.QWidget:
+            """Put the instrument directly under its numeric readout, same left edge."""
+            wrap = QtWidgets.QWidget()
+            box = QtWidgets.QVBoxLayout(wrap)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(3)
+            box.addWidget(label, 0, QtCore.Qt.AlignLeft)
+            expanding = instrument.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Expanding
+            if expanding:
+                # Underline the whole number, then keep growing with the column.
+                instrument.setMinimumWidth(max(instrument.minimumWidth(), label.width()))
+                box.addWidget(instrument)
+            else:
+                box.addWidget(instrument, 0, QtCore.Qt.AlignHCenter)
+            wrap.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            return wrap
 
         def _update_gauges(self) -> None:
             s = self.root.setting
@@ -448,11 +655,17 @@ def _install_panels() -> None:
             self.gauges["pos_cte"].setText(f"Pos CTE: {float(s.cte_steer.get()):+9.2f}")
             self.gauges["accel"].setText(f"Accel:   {float(s.cmd_accel.get()):+9.2f}")
             self.gauges["steer"].setText(f"Steer:   {float(s.cmd_steer.get()):+9.2f}")
-            if hasattr(self, "value_gauges"):
-                self.value_gauges["vel_cte"].setValue(float(s.cte_vel.get()))
-                self.value_gauges["pos_cte"].setValue(float(s.cte_steer.get()))
-                self.value_gauges["accel"].setValue(float(s.cmd_accel.get()))
-                self.value_gauges["steer"].setValue(float(s.cmd_steer.get()))
+            self.value_gauges["vel_cte"].setValue(float(s.cte_vel.get()))
+            self.value_gauges["pos_cte"].setValue(float(s.cte_steer.get()))
+            self.steer_wheel.setAngle(float(s.cmd_steer.get()))
+
+        def _sync_speed(self) -> None:
+            speed = 0.0
+            ex = self.root.exec
+            ego = getattr(ex, "ego_state", None) if ex is not None else None
+            if ego is not None:
+                speed = float(getattr(ego, "velocity", 0.0) or 0.0)
+            self.speed_dial.setSpeed(speed)
 
         def _drive(self, accel: float, steer: float) -> None:
             if self.root.exec is None:
