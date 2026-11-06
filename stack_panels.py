@@ -483,17 +483,26 @@ def _install_panels() -> None:
             )
 
     class SpeedDial(QtWidgets.QWidget):
-        """Arc speedometer. The needle tracks ego speed; the number stays inside the dial."""
+        """Arc speedometer. The caption is km/h, with m/s in brackets."""
 
-        _SIZE = 84
+        _DIAL = 84
         _MAX_MPS = 40.0
 
         def __init__(self, parent=None):
             super().__init__(parent)
             self._speed = 0.0
-            self.setFixedSize(self._SIZE, self._SIZE)
+            font = QtGui.QFont("monospace")
+            font.setStyleHint(QtGui.QFont.TypeWriter)
+            font.setFixedPitch(True)
+            font.setPointSize(10)
+            self._caption_font = font
+            metrics = QtGui.QFontMetrics(font)
+            sample = "-999.9 km/h (-999.9 m/s)"
+            advance = metrics.horizontalAdvance(sample) if hasattr(metrics, "horizontalAdvance") else metrics.width(sample)
+            self._caption_h = metrics.height() + 2
+            self.setFixedSize(max(self._DIAL, int(advance) + 8), self._DIAL + self._caption_h)
             self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-            self.setToolTip("Speed (m/s)")
+            self.setToolTip("Speed")
 
         def setSpeed(self, mps: float) -> None:
             mps = float(mps)
@@ -502,13 +511,15 @@ def _install_panels() -> None:
             self._speed = mps
             self.update()
 
+        def caption(self) -> str:
+            return f"{self._speed * 3.6:.1f} km/h ({self._speed:.1f} m/s)"
+
         def paintEvent(self, _event) -> None:  # noqa: N802
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             colors = _meter_palette(self)
-            side = min(self.width(), self.height())
-            center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0 + 2.0)
-            radius = side / 2.0 - 8.0
+            center = QtCore.QPointF(self.width() / 2.0, self._DIAL / 2.0 + 1.0)
+            radius = self._DIAL / 2.0 - 8.0
             painter.setPen(QtGui.QPen(colors["rim"], 1.5))
             painter.setBrush(colors["face"])
             painter.drawEllipse(center, radius, radius)
@@ -526,33 +537,22 @@ def _install_panels() -> None:
                 painter.drawArc(arc, start, int(sweep * frac))
 
             ang = math.radians(210.0 - 240.0 * frac)
-            # Needle stays outside the center numerals so the speed stays readable.
-            inner = 16.0
             outer = arc_r - 1.0
             painter.setPen(QtGui.QPen(colors["ink"], 2.0, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
             painter.drawLine(
-                QtCore.QPointF(center.x() + math.cos(ang) * inner, center.y() - math.sin(ang) * inner),
+                center,
                 QtCore.QPointF(center.x() + math.cos(ang) * outer, center.y() - math.sin(ang) * outer),
             )
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(colors["neg"] if self._speed < 0.0 else colors["accent"])
+            painter.drawEllipse(center, 3.0, 3.0)
 
-            font = QtGui.QFont("monospace")
-            font.setStyleHint(QtGui.QFont.TypeWriter)
-            font.setFixedPitch(True)
-            font.setPointSize(9)
-            painter.setFont(font)
+            painter.setFont(self._caption_font)
             painter.setPen(colors["neg"] if self._speed < 0.0 else colors["ink"])
             painter.drawText(
-                QtCore.QRectF(center.x() - 24.0, center.y() - 10.0, 48.0, 14.0),
+                QtCore.QRectF(0.0, float(self._DIAL), float(self.width()), float(self._caption_h)),
                 QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
-                f"{self._speed:.1f}",
-            )
-            font.setPointSize(7)
-            painter.setFont(font)
-            painter.setPen(colors["muted"])
-            painter.drawText(
-                QtCore.QRectF(center.x() - 24.0, center.y() + 4.0, 48.0, 11.0),
-                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
-                "m/s",
+                self.caption(),
             )
 
     class ControlPanel(QtWidgets.QGroupBox):

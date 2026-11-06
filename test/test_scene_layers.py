@@ -137,7 +137,9 @@ def test_control_readouts_keep_their_instruments(window, qapp):
     assert window.win.findChild(window.QtWidgets.QWidget, "steerWheel")._steer == 0.35
     window.exec.ego_state.velocity = 12.5
     window.setting.vehicle_state.set("speed-check")
-    assert window.win.findChild(window.QtWidgets.QWidget, "speedGauge")._speed == 12.5
+    dial = window.win.findChild(window.QtWidgets.QWidget, "speedGauge")
+    assert dial._speed == 12.5
+    assert dial.caption() == "45.0 km/h (12.5 m/s)"
     assert "Accel" in control.gauges["accel"].text()
     assert "Steer" in control.gauges["steer"].text()
 
