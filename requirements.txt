@@ -1,6 +1,22 @@
-# Qt5 visualizer for AVLite — install alongside avlite.
-# PyQt5 chosen over PySide2: PySide2 has no Python 3.12 wheels; PyQt5 5.15.x
-# ships abi3 manylinux wheels and is the best-supported binding for pyqtgraph.
-PyQt5>=5.15
-pyqtgraph>=0.13
+# Runtime dependencies for the Qt5 visualizer (Python 3.10+).
+# Install into the same environment as AVLite. AVLite itself is not listed;
+# `pip install avlite` first, then `pip install -r requirements.txt`.
+#
+# These are the third-party modules this package imports while running
+# (stdlib and avlite are omitted). PyQt5's wheel pulls PyQt5-Qt5 and
+# PyQt5-sip. pyqtgraph's wheel pulls colorama. OpenGL plots use Qt's
+# QOpenGLWidget; this package does not import PyOpenGL.
+
+# qt_binding.import_qt. 5.15.6 is the first 5.15 release with abi3 wheels
+# that install on Python 3.10+.
+PyQt5>=5.15.6
+
+# qt_binding.import_pyqtgraph. 0.13.7 is the first release that runs on
+# NumPy 2; 0.14+ is the Python 3.10 line.
+pyqtgraph>=0.13.7
+
+# plot_widgets. Matches AVLite's numpy>=2.0 (Python 3.10+ wheels).
 numpy>=2.0
+
+# settings.PluginSettingsSchema. Loaded when AVLite imports the plugin.
+pydantic>=2.0
