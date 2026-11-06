@@ -13,6 +13,8 @@ class PluginSettingsSchema(SettingsSchema):
     p60_shortcut_mode: bool = Field(default=False, description="Collapse stack panels; show shortcut help.")
     p60_next_profile: str = Field(default="default", description="Profile switched to with shortcut F.")
     p60_shortcuts: dict = Field(default_factory=dict, description="Shortcut id to key sequence overrides.")
+    p60_settings_folded: bool = Field(default=False, description="Fold the Settings toolbar to its title.")
+    p60_shortcuts_folded: bool = Field(default=False, description="Fold the Shortcuts panel to its title.")
     p69_mouse_drag_slowdown_factor: float = Field(
         default=0.5, description="Slowdown factor when dragging plots with the mouse."
     )
@@ -56,6 +58,10 @@ class PluginSettingsSchema(SettingsSchema):
     )
     p67_global_plan_view: bool = Field(default=True, description="Show global plan panel.")
     p67_local_plan_view: bool = Field(default=True, description="Show local plan panel.")
+    p67_perception_folded: bool = Field(default=False, description="Fold the Perception panel to its title.")
+    p67_plan_folded: bool = Field(default=False, description="Fold the Planning panel to its title.")
+    p67_control_folded: bool = Field(default=False, description="Fold the Control panel to its title.")
+    p67_execution_folded: bool = Field(default=False, description="Fold the Execution panel to its title.")
 
     p68_show_core_logs: bool = Field(default=True, description="Show core module logs.")
     p68_show_perceive_logs: bool = Field(default=True, description="Show perception logs.")
@@ -69,6 +75,7 @@ class PluginSettingsSchema(SettingsSchema):
     p68_max_log_lines: int = Field(default=1000, description="Max log lines retained.")
     p68_log_view_expanded: bool = Field(default=False, description="Use the taller log panel.")
     p68_log_pull_time: int = Field(default=50, description="Log refresh interval (ms).")
+    p68_log_folded: bool = Field(default=False, description="Fold the Log panel to its title.")
 
 
 PluginSettings = PluginSettingsSchema()

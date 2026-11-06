@@ -112,6 +112,20 @@ class VisualizerQtWindow:
         self.update_views()
         self.log_panel._flush()
         self.log_panel._apply_level(str(self.setting.log_level.get() or "INFO"))
+        self._attach_folds()
+
+    def _attach_folds(self) -> None:
+        from .panel_fold import attach_panel_fold
+
+        setting = self.setting
+        panels = self.stack_panels
+        attach_panel_fold(self.config_bar, setting.p60_settings_folded, name="foldSettings")
+        attach_panel_fold(self.shortcut_help, setting.p60_shortcuts_folded, name="foldShortcuts")
+        attach_panel_fold(panels.perception, setting.p67_perception_folded, name="foldPerception")
+        attach_panel_fold(panels.planning, setting.p67_plan_folded, name="foldPlanning")
+        attach_panel_fold(panels.control, setting.p67_control_folded, name="foldControl")
+        attach_panel_fold(panels.execution, setting.p67_execution_folded, name="foldExecution")
+        attach_panel_fold(self.log_panel, setting.p68_log_folded, name="foldLog")
 
     def _build_menu(self) -> None:
         QtWidgets = self.QtWidgets
@@ -259,8 +273,12 @@ class VisualizerQtWindow:
         if key == Qt.Key_Escape:
             self.win.setFocus()
             return True
-        extra = self._override_action(self._pressed_sequence(event))
+        sequence = self._pressed_sequence(event)
+        extra = self._override_action(sequence)
         if extra and self._run_shortcut(extra):
+            return True
+        # A rebound shortcut no longer answers on its original key.
+        if sequence and self._default_suppressed(sequence):
             return True
         if text == "Q":
             self.win.close()
@@ -403,6 +421,18 @@ class VisualizerQtWindow:
             if bound and bound != shortcut.default and bound == sequence:
                 return shortcut.id
         return ""
+
+    def _default_suppressed(self, sequence: str) -> bool:
+        """True when *sequence* is a catalog default that an override replaced."""
+        from .settings import PluginSettings
+        from .shortcuts import SHORTCUTS
+
+        overrides = dict(getattr(PluginSettings, "p60_shortcuts", {}) or {})
+        for shortcut in SHORTCUTS:
+            bound = str(overrides.get(shortcut.id, "") or "")
+            if bound and bound != shortcut.default and shortcut.default == sequence:
+                return True
+        return False
 
     def _run_shortcut(self, action: str) -> bool:
         if action == "quit":

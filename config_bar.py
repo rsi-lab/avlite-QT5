@@ -114,19 +114,34 @@ def _install() -> None:
             grid.setContentsMargins(4, 4, 4, 4)
             row = 0
             last = None
+            self._shortcut_keys = {}
             for entry in SHORTCUTS:
                 if entry.group != last:
                     heading = QtWidgets.QLabel(entry.group)
                     heading.setStyleSheet("font-weight: bold;")
                     grid.addWidget(heading, row, 0)
                     last = entry.group
+                    row += 1
                 key = QtWidgets.QLabel(entry.default)
+                key.setObjectName(f"shortcutHelp_{entry.id}")
                 key.setMinimumWidth(90)
+                self._shortcut_keys[entry.id] = key
                 grid.addWidget(key, row, 1)
                 grid.addWidget(QtWidgets.QLabel(entry.label), row, 2)
                 row += 1
             scroll.setWidget(inner)
             outer.addWidget(scroll)
+            self.refresh_shortcut_labels()
+
+        def refresh_shortcut_labels(self) -> None:
+            from .settings import PluginSettings
+
+            overrides = dict(getattr(PluginSettings, "p60_shortcuts", {}) or {})
+            for entry in SHORTCUTS:
+                label = self._shortcut_keys.get(entry.id)
+                if label is None:
+                    continue
+                label.setText(str(overrides.get(entry.id) or entry.default))
 
         def sync_from_settings(self) -> None:
             s = self.root.setting

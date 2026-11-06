@@ -20,20 +20,31 @@ def open_plugin_browser(root) -> None:
 
 
 class _Browser:
-    def __init__(self, root, QtCore, QtWidgets):
+    def __init__(self, root, QtCore, QtWidgets, host=None):
         self.root = root
         self.QtWidgets = QtWidgets
         self.QtCore = QtCore
-        self.win = QtWidgets.QDialog(root.win)
-        self.win.setWindowTitle("Plugins")
-        self.win.setObjectName("pluginBrowser")
-        self.win.resize(760, 520)
+        self._owns_window = host is None
+        if host is None:
+            self.win = QtWidgets.QDialog(root.win)
+            self.win.setWindowTitle("Plugins")
+            self.win.setObjectName("pluginBrowser")
+            screen = QtWidgets.QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen is not None else QtCore.QRect(0, 0, 1280, 800)
+            self.win.resize(min(860, max(640, avail.width() - 96)), min(640, max(420, avail.height() - 96)))
+            self.win.setMinimumSize(min(520, max(360, avail.width() - 80)), min(360, max(280, avail.height() - 80)))
+        else:
+            self.win = host
         layout = QtWidgets.QVBoxLayout(self.win)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
         splitter = QtWidgets.QSplitter()
         self.builtin = QtWidgets.QListWidget()
         self.builtin.setObjectName("builtinPlugins")
+        self.builtin.setMinimumHeight(120)
         self.community = QtWidgets.QListWidget()
         self.community.setObjectName("communityPlugins")
+        self.community.setMinimumHeight(120)
         left = QtWidgets.QWidget()
         left_l = QtWidgets.QVBoxLayout(left)
         left_l.addWidget(QtWidgets.QLabel("Built-in plugins"))
@@ -65,14 +76,16 @@ class _Browser:
         layout.addLayout(add)
 
         buttons = QtWidgets.QHBoxLayout()
-        for label, slot, name in (
+        actions = [
             ("Details", self._details, "pluginDetails"),
             ("Remove built-in", self._remove_builtin, "removeBuiltin"),
             ("Remove community", self._remove_community, "removeCommunity"),
             ("Reset built-in", self._reset_builtin, "resetBuiltin"),
             ("Reset community", self._reset_community, "resetCommunity"),
-            ("Close", self.win.accept, "closePlugins"),
-        ):
+        ]
+        if self._owns_window:
+            actions.append(("Close", self.win.accept, "closePlugins"))
+        for label, slot, name in actions:
             btn = QtWidgets.QPushButton(label)
             btn.setObjectName(name)
             btn.clicked.connect(slot)
