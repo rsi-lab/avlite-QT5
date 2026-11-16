@@ -70,7 +70,8 @@ def test_config_bar_and_log_are_visible(window, qapp):
 
     text = log_panel.view.toPlainText()
     assert "Log initialized." in text
-    assert "Loaded settings from profile" in text
+    # The default profile's log level is WARN, so the INFO load line stays out.
+    assert "Log level updated to: WARN" in text
     info = window.win.findChild(QtCore.QObject, "logLevel_INFO")
     assert info is not None and info.isVisible()
     QtTest.QTest.mouseClick(info, QtCore.Qt.LeftButton)
@@ -109,6 +110,9 @@ def test_left_click_teleports_ego(window, qapp):
     from PyQt5 import QtCore
 
     _show(window, qapp)
+    window.setting.p66_global_zoom = 40.0
+    window.update_ui()
+    qapp.processEvents()
     plot = window.global_plot
     ego = window.exec.ego_state
     target_x, target_y = ego.x + 12.0, ego.y - 9.0
@@ -124,6 +128,9 @@ def test_local_right_click_spawns_npc(window, qapp):
     from PyQt5 import QtCore
 
     _show(window, qapp)
+    window.setting.p67_show_local_global_view.set(True)
+    window.update_views()
+    qapp.processEvents()
     pm = getattr(window.exec.world, "pm", None) or window.exec.pm
     before = len(list(getattr(pm, "agent_vehicles", []) or []))
     plot = window.local_plot.xy_plot

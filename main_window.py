@@ -194,8 +194,8 @@ class VisualizerQtWindow:
     def _apply_theme(self) -> None:
         dark = bool(self.setting.p60_dark_mode.get())
         if dark:
-            self.setting.p60_bg_color = "#1e1e1e"
-            self.setting.p60_fg_color = "#dddddd"
+            self.setting.p60_bg_color = "#333333"
+            self.setting.p60_fg_color = "white"
             self.win.setStyleSheet(
                 "QWidget { background: #2b2b2b; color: #dddddd; }"
                 "QGroupBox { font-weight: bold; border: 1px solid #555; margin-top: 6px; }"
@@ -204,8 +204,8 @@ class VisualizerQtWindow:
                 "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #3a3a3a; }"
             )
         else:
-            self.setting.p60_bg_color = "#f5f5f5"
-            self.setting.p60_fg_color = "#222222"
+            self.setting.p60_bg_color = "white"
+            self.setting.p60_fg_color = "black"
             self.win.setStyleSheet("")
         self.local_plot.update_theme(self.setting.p60_bg_color, self.setting.p60_fg_color)
         self.global_plot.update_theme(self.setting.p60_bg_color, self.setting.p60_fg_color)
@@ -767,41 +767,63 @@ class VisualizerQtWindow:
         self.exec.world.spawn_agent(agent_state, global_plan=global_plan)
 
     def _pin_self_as_community_plugin(self) -> None:
-        """Keep this package listed so stack sync does not unload the running UI."""
+        """Keep this package listed so stack sync does not unload the running UI.
+
+        A bundled profile can name this plugin with a path that is not on this
+        machine. That entry is replaced with the checkout that is already running.
+        A path that does resolve is left as the profile stored it.
+        """
         from pathlib import Path
+
+        from avlite.c60_apps.c68_paths import PluginPaths
 
         plugin_dir = str(Path(__file__).resolve().parent)
         plugins = dict(AppSettings.c62_community_plugins or {})
-        plugins.setdefault(self.hosting_plugin_name, plugin_dir)
+        stored = plugins.get(self.hosting_plugin_name)
+        resolved = PluginPaths.resolve(self.hosting_plugin_name, str(stored)) if stored else None
+        if resolved is None or not Path(resolved).is_dir():
+            plugins[self.hosting_plugin_name] = plugin_dir
         AppSettings.c62_community_plugins = plugins
 
     def load_settings(self, only_stack: bool = False, profile: str | None = None) -> None:
         if profile:
             self.setting.c60_selected_profile.set(profile)
         else:
-            profile = self.setting.c60_selected_profile.get()
+            profile = str(self.setting.c60_selected_profile.get() or "default")
         previous = self.loaded_profile
         load_setting(AppSettings, profile=profile)
         self._pin_self_as_community_plugin()
         self.setting.sync_app_from_singleton()
-        if not only_stack:
-            load_setting(self.setting.schema, profile=profile)
-            from .settings import PluginSettings
-
-            self.setting.p60_dark_mode.set(bool(PluginSettings.p60_dark_mode))
-            self.setting.p60_ui_refresh_hz = float(PluginSettings.p60_ui_refresh_hz)
-            self.setting.p66_xy_zoom = float(PluginSettings.p66_xy_zoom)
-            self.setting.p66_frenet_zoom = float(PluginSettings.p66_frenet_zoom)
-            self.setting.p66_global_zoom = float(PluginSettings.p66_global_zoom)
-            self.setting.pull_plugin_schema()
+        # The name in the file can disagree with the file that was just loaded.
+        # Keep the profile the caller asked for, which is what the settings
+        # window does after it syncs the app block.
+        self.setting.c60_selected_profile.set(profile)
+        AppSettings.c60_selected_profile = profile
         load_stack_settings(profile=profile)
         self._pin_self_as_community_plugin()
+        self.setting.c60_selected_profile.set(profile)
+        AppSettings.c60_selected_profile = profile
+        if only_stack:
+            self.setting.push_plugin_schema()
+        else:
+            from .setting_model import apply_visualizer_profile
+
+            apply_visualizer_profile(self.setting.schema, profile)
+            self.setting.pull_plugin_schema()
+            hz = max(5.0, float(self.setting.p60_ui_refresh_hz))
+            self._ui_timer.setInterval(int(1000 / hz))
         self.setting.sync_stack_from_singletons()
         ConfigPaths.set_startup_profile(profile)
         self.loaded_profile = profile
         self.setting.profile_list = list_profiles(AppSettings)
+        self._apply_theme()
+        if hasattr(self, "stack_panels"):
+            self.stack_panels.refresh()
+        self.update_views()
+        if hasattr(self, "log_panel"):
+            self.log_panel.reset()
         if hasattr(self, "config_bar"):
-            self.config_bar.sync_from_settings()
+            self.config_bar.refresh_shortcut_labels()
         log.info("Loaded settings from profile: %s", profile)
         if previous is not None and previous != profile:
             self.show_profile_note()

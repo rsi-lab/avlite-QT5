@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
+
+log = logging.getLogger(__name__)
 
 from avlite.c10_perception.c12_perception_strategy import (
     DetectionStrategy,
@@ -22,6 +25,43 @@ from avlite.c40_execution.c42_execution_strategy import ExecutionStrategy
 from avlite.c40_execution.c49_settings import ExecutionSettings
 from avlite.c60_apps.c62_factory import StackSettingsSync
 from avlite.c60_apps.c69_settings import AppSettings
+
+
+def apply_visualizer_profile(schema, profile: str) -> None:
+    """Load the visualizer block the way a Tk-authored profile stores it.
+
+    Bundled profiles keep the shared fields under ``plugins.p60_visualizer_tk``.
+    A Qt save writes ``plugins.avlite_QT5`` on top of that. Missing keys stay at
+    the schema default, so a switch does not keep the previous profile's zoom
+    or which plots are open.
+    """
+    import yaml
+    from avlite.c60_apps.c64_settings_schema import apply_validated_to_setting, validate_profile
+    from avlite.c60_apps.c65_setting_utils import SettingsValidationError, profile_file_path
+
+    model = type(schema)
+    path = profile_file_path(profile, for_write=False)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError):
+        config = {}
+    plugins = config.get("plugins") if isinstance(config, dict) else None
+    plugins = plugins if isinstance(plugins, dict) else {}
+    values = model.model_validate({}).model_dump()
+    for key in ("p60_visualizer_tk", "avlite_QT5"):
+        section = plugins.get(key)
+        if not isinstance(section, dict):
+            continue
+        for name, value in section.items():
+            if name in values:
+                values[name] = value
+    try:
+        validated = validate_profile(model, values, filepath=path, profile=profile)
+    except SettingsValidationError as exc:
+        log.error("%s", exc)
+        return
+    apply_validated_to_setting(schema, validated)
 
 from .settings import PluginSettings
 
@@ -296,38 +336,21 @@ class VisualizationSettings:
                 setattr(self, name, value)
 
     def push_plugin_schema(self) -> None:
-        """Copy toolbar/plot values onto the persisted plugin schema."""
+        """Copy live visualizer values back onto the schema.
+
+        ``load_stack_settings`` reloads every registered plugin and, when this
+        package's section is absent, replaces the schema with its defaults.
+        Pushing first keeps an in-progress UI across that reload.
+        """
         schema = self.schema
-        schema.p60_dark_mode = bool(self.p60_dark_mode.get())
-        schema.p60_shortcut_mode = bool(self.p60_shortcut_mode.get())
-        schema.p60_next_profile = str(self.p60_next_profile.get() or "default")
-        schema.p60_settings_folded = bool(self.p60_settings_folded.get())
-        schema.p60_shortcuts_folded = bool(self.p60_shortcuts_folded.get())
-        schema.p67_perception_folded = bool(self.p67_perception_folded.get())
-        schema.p67_plan_folded = bool(self.p67_plan_folded.get())
-        schema.p67_control_folded = bool(self.p67_control_folded.get())
-        schema.p67_execution_folded = bool(self.p67_execution_folded.get())
-        schema.p68_log_folded = bool(self.p68_log_folded.get())
-        schema.p69_mouse_drag_slowdown_factor = float(self.p69_mouse_drag_slowdown_factor)
-        schema.p66_xy_zoom = float(self.p66_xy_zoom)
-        schema.p66_frenet_zoom = float(self.p66_frenet_zoom)
-        schema.p66_global_zoom = float(self.p66_global_zoom)
-        schema.p67_global_plan_view = bool(self.p67_global_plan_view.get())
-        schema.p67_show_control_view = bool(self.p67_show_control_view.get())
-        schema.p67_show_local_global_view = bool(self.p67_show_local_global_view.get())
-        schema.p67_show_local_frenet_view = bool(self.p67_show_local_frenet_view.get())
-        schema.p67_plot_sashes = {
-            str(name): float(fraction) for name, fraction in dict(self.p67_plot_sashes or {}).items()
-        }
-        schema.p68_show_core_logs = bool(self.p68_show_core_logs.get())
-        schema.p68_show_plugins_logs = bool(self.p68_show_plugins_logs.get())
-        schema.p68_show_perceive_logs = bool(self.p68_show_perceive_logs.get())
-        schema.p68_show_plan_logs = bool(self.p68_show_plan_logs.get())
-        schema.p68_show_control_logs = bool(self.p68_show_control_logs.get())
-        schema.p68_show_execute_logs = bool(self.p68_show_execute_logs.get())
-        schema.p68_show_vis_logs = bool(self.p68_show_vis_logs.get())
-        schema.p68_show_common_logs = bool(self.p68_show_common_logs.get())
-        schema.p68_log_view_expanded = bool(self.p68_log_view_expanded.get())
+        for name in type(schema).model_fields:
+            current = getattr(self, name, None)
+            if isinstance(current, Var):
+                setattr(schema, name, current.get())
+            elif isinstance(current, dict):
+                setattr(schema, name, dict(current))
+            elif current is not None and not callable(current):
+                setattr(schema, name, current)
 
     def sync_app_from_singleton(self) -> None:
         self.c62_load_plugins.set(bool(AppSettings.c62_load_plugins))

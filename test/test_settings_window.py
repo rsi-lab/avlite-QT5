@@ -159,9 +159,12 @@ def test_settings_dialog_fits_and_actions(window, qapp):
 
         plugins = dlg.win.findChild(QtWidgets.QWidget, "settingsPluginsPage")
         assert plugins is not None
-        assert plugins.findChild(QtWidgets.QListWidget, "communityPlugins") is not None
-        assert plugins.findChild(QtWidgets.QPushButton, "addCommunityPlugin") is not None
-        assert plugins.findChild(QtWidgets.QListWidget, "communityPlugins").count() >= 1
+        table = plugins.findChild(QtWidgets.QTableWidget, "communityTable")
+        assert table is not None and table.rowCount() >= 1
+        assert plugins.findChild(QtWidgets.QPushButton, "btnInstall") is not None
+        assert plugins.findChild(QtWidgets.QPushButton, "btnAddProfile") is not None
+        names = [table.item(row, 0).text() for row in range(table.rowCount())]
+        assert "avlite-QT5" in names
 
         recorded = []
         real_save = setting_utils.save_setting

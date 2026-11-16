@@ -309,6 +309,22 @@ def _install_log() -> None:
             QtWidgets.QApplication.clipboard().setText(self.view.toPlainText())
             logging.getLogger(__name__).info("Log copied to clipboard.")
 
+        def reset(self) -> None:
+            """Re-read filters and the level after a profile load."""
+            for key, box in self._checks.items():
+                box.blockSignals(True)
+                box.setChecked(self._flag(key))
+                box.blockSignals(False)
+            self._file.blockSignals(True)
+            self._file.setChecked(bool(self.root.setting.log_to_file.get()))
+            self._file.blockSignals(False)
+            level = str(self.root.setting.log_level.get() or "INFO")
+            self._level.blockSignals(True)
+            for button in self._level.buttons():
+                button.setChecked(button.text() == level)
+            self._level.blockSignals(False)
+            self._apply_level(level)
+
         def clear(self) -> None:
             self.view.clear()
             while True:

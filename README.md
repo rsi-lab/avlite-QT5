@@ -80,7 +80,7 @@ Headless check: `QT_QPA_PLATFORM=offscreen AVLITE_QT_NO_OPENGL=1 python3 -m pyte
 | Feature | Tk dev | Qt5 before | Qt5 after |
 |---|---|---|---|
 | App command, community import, no Qt at import | `avlite` Tk app | `qt5`, lazy Qt import | same, targets AVLite ≥ 0.6.7 |
-| BasicSim Yas Marina: ego, plans, boundaries, lattice, predictions, occupancy, lidar, clusters | yes | yes | yes |
+| BasicSim Yas Marina: ego, plans, boundaries, lattice, predictions, occupancy, lidar, clusters | yes | yes | yes. GMM and GP use the Tk polylines and 50%/95% rings |
 | HD-map hover and raceline speed hover | yes | yes | yes |
 | Exec start/stop/step/reset, tasks, pace, capability filters, probabilistic collision, save plan/occupancy/start pose | yes | yes | yes. Step passes `localization_dt` |
 | Keyboard and mouse, including plan step `n` / `b` | yes | `n` / `b` did not move the waypoint | `n` / `b` call the planner step |
@@ -88,8 +88,8 @@ Headless check: `QT_QPA_PLATFORM=offscreen AVLITE_QT_NO_OPENGL=1 python3 -m pyte
 | Control plot: speed (km/h and m/s, accel arc), steer wheel, g-g trail | yes | missing | third pane. Circles share a size and wrap when that makes them larger |
 | Show/hide plots, including Control, and sash fractions | `p67_plot_visible`, `p67_plot_sashes` | Global / Local only | Control checkbox plus `p67_plot_sashes` for the three panes |
 | Manual drive updates `controller.cmd` so the gauges follow | yes | gauges ignored the command | `applied_cmd` and `controller.cmd` |
-| Settings window and profile note when the profile changes | yes | note field, no popup | popup when the note is non-empty |
-| Plugin browser | GitHub install, pip, device login | lists registered paths | still lists paths |
+| Settings window and profile note when the profile changes | yes | visualizer block stayed on schema defaults, so zoom and open plots did not follow the profile | loads `plugins.p60_visualizer_tk`, then a Qt section if one was saved. Stack rebuilds. Note popup only when the profile actually changes and the note is non-empty |
+| Plugin browser | registry columns, install, add to profile, uninstall, update, device login, details | lists registered paths | same columns and the same `_PluginOperations` actions. Member sign-in uses `_GitHubClient` (no public wrapper). Details render the README with Qt markdown |
 | Log filters, File and Help menus | yes | yes, plus a View menu | same |
 | OpenGL plots | Matplotlib | pyqtgraph, `p60_use_opengl` default on | unchanged |
 | Separate World Bridge panel | yes, foldable | bridge, contract, and capabilities live in Execution | left in Execution |
@@ -98,7 +98,6 @@ Headless check: `QT_QPA_PLATFORM=offscreen AVLITE_QT_NO_OPENGL=1 python3 -m pyte
 
 Left out on purpose:
 
-- The GitHub plugin marketplace (device login, install, pip) stays `avlite plugins`.
 - `PlotStrategy` panes are Tk frames, so this window cannot embed them.
 - The World Bridge block stays inside Execution. The bridge combo, contract button, and capability checks are already there.
 - Tk DPI scaling, ttk themes, and the Matplotlib blit cache have no Qt equivalent.
@@ -115,6 +114,16 @@ BasicSim on Yas Marina, offscreen. The control plot is the right-hand pane.
 ![Control plot](docs/qt_visualizer_control_plot.png)
 
 ![Shortcut mode](docs/qt_visualizer_shortcut_mode.png)
+
+The Prediction profile hides the global plot, opens local XY at zoom 170, and selects ConstantVelocityGMM.
+
+![Prediction profile](docs/qt_profile_prediction.png)
+
+GMM draws one solid polyline per mode (opacity is the mode weight) and unfilled 50% and 95% rings about every half-second. GP draws the mean the same way, with one pair of rings. Both match the Tk painter on the same BasicSim agent.
+
+![GMM forecast](docs/qt_gmm_prediction.png)
+
+![GP forecast](docs/qt_gp_prediction.png)
 
 ## Tests
 

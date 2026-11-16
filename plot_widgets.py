@@ -174,6 +174,25 @@ def _ellipse_polygon(center: np.ndarray, cov: np.ndarray, percentile: float, n: 
     return np.vstack((polygon, polygon[:1]))
 
 
+# Tk draws these as solid polylines (darkorange ahead of the ego, mediumpurple behind)
+# and, for GP and GMM, unfilled 50% and 95% rings about every half-second.
+_AHEAD_RGB = (255, 140, 0)
+_BEHIND_RGB = (147, 112, 219)
+_ELLIPSE_PERCENTILES = (0.5, 0.95)
+_ELLIPSE_STRIDE_S = 0.5
+_ELLIPSE_SAMPLES = 24
+
+
+def _ellipse_steps(n_steps: int, dt: float, stride_s: float = _ELLIPSE_STRIDE_S) -> list[int]:
+    if n_steps <= 0:
+        return []
+    stride = max(1, int(round(stride_s / dt))) if dt > 0.0 else n_steps
+    indices = list(range(stride - 1, n_steps, stride))
+    if not indices or indices[-1] != n_steps - 1:
+        indices.append(n_steps - 1)
+    return indices
+
+
 def _step_covariance(pred, agent_id, mode_index: int, step: int) -> np.ndarray | None:
     joint = getattr(pred, "covariance", None)
     if isinstance(joint, dict) and agent_id in joint:
@@ -187,6 +206,61 @@ def _step_covariance(pred, agent_id, mode_index: int, step: int) -> np.ndarray |
         if mat.ndim == 4 and mode_index < mat.shape[0] and step < mat.shape[1]:
             return mat[mode_index, step]
     return None
+
+
+def _prediction_drawings(pred, agents, ego) -> tuple[list, list]:
+    """World-frame forecast lines and ellipse rings, matching the Tk painter.
+
+    Each entry is ``(Nx2, (r, g, b, a))`` with ``a`` in 0..1. Line opacity is
+    the mode weight. A ring's opacity is that weight times its percentile.
+    """
+    from avlite.c10_perception.c11_perception_model import GMM, GP, MultiTrajectory, SingleTrajectory
+
+    if not isinstance(pred, (SingleTrajectory, MultiTrajectory, GP, GMM)) or ego is None:
+        return [], []
+    heading = np.array([np.cos(float(ego.theta)), np.sin(float(ego.theta))])
+    ego_xy = np.array([float(ego.x), float(ego.y)])
+    draw_rings = isinstance(pred, (GP, GMM))
+    dt = float(getattr(pred, "predict_delta_t", 0.1) or 0.1)
+    grouped: dict = {}
+    for aid, mode, path, weight in _forecast_modes(pred):
+        grouped.setdefault(aid, []).append((mode, path, weight))
+    lines: list = []
+    rings: list = []
+    for agent in agents:
+        modes = grouped.get(getattr(agent, "agent_id", None))
+        if not modes:
+            continue
+        to_agent = np.array([float(agent.x) - ego_xy[0], float(agent.y) - ego_xy[1]])
+        rgb = _BEHIND_RGB if float(np.dot(heading, to_agent)) < 0.0 else _AHEAD_RGB
+        pose = np.array([[float(agent.x), float(agent.y)]], dtype=float)
+        for mode_index, path, weight in modes:
+            alpha = float(np.clip(weight, 0.0, 1.0))
+            if alpha <= 0.0 or len(path) == 0:
+                continue
+            full = np.vstack((pose, np.asarray(path, dtype=float)[:, :2]))
+            lines.append((full, (*rgb, alpha)))
+            if not draw_rings:
+                continue
+            for step in _ellipse_steps(len(path), dt):
+                cov = _step_covariance(pred, agent.agent_id, mode_index, step)
+                if cov is None:
+                    continue
+                center = np.asarray(path[step], dtype=float)
+                for percentile in _ELLIPSE_PERCENTILES:
+                    poly = _ellipse_polygon(center, cov, percentile, _ELLIPSE_SAMPLES)
+                    if poly is not None:
+                        rings.append((poly, (*rgb, alpha * percentile)))
+    return lines, rings
+
+
+def _map_drawings(drawings, gt) -> list:
+    mapped = []
+    for pts, color in drawings:
+        sd = _to_sd(gt, pts)
+        if len(sd) >= 2:
+            mapped.append((sd, color))
+    return mapped
 
 
 def _occupancy_grid(pm):
@@ -589,6 +663,64 @@ def _install_widgets() -> None:
     pg = import_pyqtgraph()
 
     _WIDGETS_READY = True
+
+    class _ForecastLayer(pg.GraphicsObject):
+        """One paint for every forecast line and ellipse ring."""
+
+        def __init__(self):
+            super().__init__()
+            self.lines: list = []
+            self.rings: list = []
+            self._polys: list = []
+            self._bounds = QtCore.QRectF()
+
+        def clear(self) -> None:
+            self.set_drawings([], [])
+
+        def set_drawings(self, lines, rings) -> None:
+            self.prepareGeometryChange()
+            self.lines = lines
+            self.rings = rings
+            polys = []
+            xs: list[np.ndarray] = []
+            ys: list[np.ndarray] = []
+            for width, batch in ((1.0, rings), (1.5, lines)):
+                for pts, color in batch:
+                    arr = np.asarray(pts, dtype=float)
+                    if arr.ndim != 2 or len(arr) < 2:
+                        continue
+                    poly = QtGui.QPolygonF(
+                        [QtCore.QPointF(float(x), float(y)) for x, y in arr[:, :2]]
+                    )
+                    polys.append((poly, color, width))
+                    xs.append(arr[:, 0])
+                    ys.append(arr[:, 1])
+            self._polys = polys
+            if xs:
+                x = np.concatenate(xs)
+                y = np.concatenate(ys)
+                self._bounds = QtCore.QRectF(
+                    float(x.min()), float(y.min()),
+                    float(x.max() - x.min()) or 1.0,
+                    float(y.max() - y.min()) or 1.0,
+                )
+            else:
+                self._bounds = QtCore.QRectF()
+            self.update()
+
+        def paint(self, painter, *args) -> None:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            for poly, color, width in self._polys:
+                red, green, blue, alpha = color
+                pen = QtGui.QPen(QtGui.QColor(int(red), int(green), int(blue), int(round(float(alpha) * 255))))
+                pen.setCosmetic(True)
+                pen.setWidthF(width)
+                painter.setPen(pen)
+                painter.drawPolyline(poly)
+
+        def boundingRect(self):
+            return self._bounds
 
     class GlobalPlotWidget(pg.PlotWidget):
         """Global map / raceline / HD-map overview with ego marker."""
@@ -1188,15 +1320,9 @@ def _install_widgets() -> None:
             self.xy_plot.addItem(self.xy_lidar)
             self.xy_clusters = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(255, 255, 0, 220), pen=None)
             self.xy_plot.addItem(self.xy_clusters)
-            self.xy_pred = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.xy_pred_behind = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#7e57c2", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.xy_ellipses = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1), connect="finite",
-            )
+            self.xy_pred = _ForecastLayer()
+            self.xy_pred.setZValue(8)
+            self.xy_plot.addItem(self.xy_pred)
             self.xy_past = self.xy_plot.plotItem.plot(pen=pg.mkPen("#66bb6a", width=1.5))
             self.xy_lattice = self.xy_plot.plotItem.plot(
                 pen=pg.mkPen("#8ec07c", width=1), connect="finite",
@@ -1240,15 +1366,9 @@ def _install_widgets() -> None:
             self.sd_agents = [
                 self.frenet_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
             ]
-            self.sd_pred = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.sd_pred_behind = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#7e57c2", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.sd_ellipses = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1), connect="finite",
-            )
+            self.sd_pred = _ForecastLayer()
+            self.sd_pred.setZValue(8)
+            self.frenet_plot.addItem(self.sd_pred)
             self.sd_lattice = self.frenet_plot.plotItem.plot(
                 pen=pg.mkPen("#8ec07c", width=1), connect="finite",
             )
@@ -1290,18 +1410,19 @@ def _install_widgets() -> None:
         def reset(self) -> None:
             for curve in (
                 self.xy_left, self.xy_right, self.xy_ref, self.xy_local, self.xy_ego,
-                self.xy_pred, self.xy_pred_behind, self.xy_ellipses, self.xy_past,
+                self.xy_past,
                 self.xy_lattice, self.xy_lattice_hit, self.xy_lattice_kin,
                 self.xy_track, self.xy_heading, self.xy_wp, self.xy_wp_next,
                 self.xy_lwp, self.xy_lwp_next,
                 self.sd_left, self.sd_right, self.sd_ref, self.sd_local, self.sd_ego,
-                self.sd_pred, self.sd_pred_behind, self.sd_ellipses,
                 self.sd_lattice, self.sd_lattice_hit, self.sd_lattice_kin,
                 self.sd_track, self.sd_wp, self.sd_wp_next, self.sd_lwp, self.sd_lwp_next,
             ):
                 curve.setData([], [])
             for c in self.xy_agents + self.sd_agents:
                 c.setData([], [])
+            self.xy_pred.clear()
+            self.sd_pred.clear()
             self.xy_lidar.setData([], [])
             self.xy_clusters.setData([], [])
             self.sd_lidar.setData([], [])
@@ -1970,60 +2091,26 @@ def _install_widgets() -> None:
         def _paint_predictions(self, stack, ego, gt, s) -> None:
             pred = getattr(stack.pm, "prediction", None) if stack.pm is not None else None
             show = bool(s.p67_show_prediction.get()) and pred is not None
-            modes = _forecast_modes(pred) if show else []
+            lines, rings = _prediction_drawings(pred, _agent_list(stack.pm), ego) if show else ([], [])
             token = (
                 show, self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
-                id(pred) if pred is not None else 0, _paths_token([m[2] for m in modes]),
+                id(pred) if pred is not None else 0, len(lines), len(rings),
             )
             if self._curve_cache.get("pred") == token:
                 return
             self._curve_cache["pred"] = token
-            ahead_xy: list[np.ndarray] = []
-            behind_xy: list[np.ndarray] = []
-            ellipses: list[np.ndarray] = []
-            if modes:
-                agents = {getattr(a, "agent_id", i): a for i, a in enumerate(_agent_list(stack.pm))}
-                heading = np.array([np.cos(float(ego.theta)), np.sin(float(ego.theta))])
-                for aid, mode, path, weight in modes:
-                    agent = agents.get(aid)
-                    pose = np.array([[float(agent.x), float(agent.y)]]) if agent is not None else path[:1]
-                    full = np.vstack([pose, path]) if len(path) else path
-                    ahead = True
-                    if agent is not None:
-                        to_agent = np.array([float(agent.x) - float(ego.x), float(agent.y) - float(ego.y)])
-                        ahead = float(np.dot(heading, to_agent)) >= 0.0
-                    (ahead_xy if ahead else behind_xy).append(full)
-                    if weight <= 0.0 or len(path) == 0:
-                        continue
-                    step = len(path) - 1
-                    cov = _step_covariance(pred, aid, mode, step)
-                    if cov is None:
-                        continue
-                    poly = _ellipse_polygon(path[step], cov, 0.5)
-                    if poly is not None:
-                        ellipses.append(poly)
-            ax, ay = _nan_join(ahead_xy)
-            bx, by = _nan_join(behind_xy)
-            ex, ey = _nan_join(ellipses)
             if self._xy_on:
-                self.xy_pred.setData(ax, ay)
-                self.xy_pred_behind.setData(bx, by)
-                self.xy_ellipses.setData(ex, ey)
+                self.xy_pred.set_drawings(lines, rings)
             else:
-                self.xy_pred.setData([], [])
-                self.xy_pred_behind.setData([], [])
-                self.xy_ellipses.setData([], [])
-            counted = np.concatenate([ax, bx]) if ax.size or bx.size else ax
-            self._count("prediction_xy", counted if self._xy_on else [])
-            self._count("prediction_ellipses", ex if self._xy_on else [])
+                self.xy_pred.clear()
+            xs = np.concatenate([np.asarray(pts)[:, 0] for pts, _color in lines]) if lines else []
+            ring_x = np.concatenate([np.asarray(pts)[:, 0] for pts, _color in rings]) if rings else []
+            self._count("prediction_xy", xs if self._xy_on else [])
+            self._count("prediction_ellipses", ring_x if self._xy_on else [])
             if self._frenet_on and gt is not None:
-                self.sd_pred.setData(*_nan_join([_to_sd(gt, p) for p in ahead_xy]))
-                self.sd_pred_behind.setData(*_nan_join([_to_sd(gt, p) for p in behind_xy]))
-                self.sd_ellipses.setData(*_nan_join([_to_sd(gt, p) for p in ellipses]))
+                self.sd_pred.set_drawings(_map_drawings(lines, gt), _map_drawings(rings, gt))
             else:
-                self.sd_pred.setData([], [])
-                self.sd_pred_behind.setData([], [])
-                self.sd_ellipses.setData([], [])
+                self.sd_pred.clear()
 
         def _set_image(self, item, grid, origin_x, origin_y, resolution, lut=None) -> None:
             image = np.asarray(grid, dtype=float)

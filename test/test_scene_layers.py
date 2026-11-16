@@ -6,14 +6,18 @@ import numpy as np
 
 
 def test_plan_prediction_lattice_occupancy_and_clusters(window):
-    from avlite.c10_perception.c11_perception_model import OccupancyMap, SingleTrajectory
+    from avlite.c10_perception.c11_perception_model import AgentState, OccupancyMap, SingleTrajectory
 
     ego = window.exec.ego_state
+    window.setting.p67_show_local_global_view.set(True)
     path = np.array(
         [[ego.x, ego.y], [ego.x + 6.0, ego.y + 1.0], [ego.x + 12.0, ego.y + 2.0]],
         dtype=float,
     )
     window.exec.pm.prediction = SingleTrajectory(trajectories={1: path})
+    window.exec.pm.agent_vehicles = [
+        AgentState(x=float(ego.x) + 6.0, y=float(ego.y) + 1.0, velocity=4.0, agent_id=1),
+    ]
     grid = np.zeros((16, 16), dtype=float)
     grid[8, 8] = 1.0
     window.exec.pm.occupancy_map = OccupancyMap(
@@ -44,6 +48,7 @@ def test_plan_prediction_lattice_occupancy_and_clusters(window):
 
     counts = window.local_plot.layer_point_counts
     assert counts["prediction_xy"] >= 3
+    assert counts["prediction_ellipses"] == 0
     assert counts["occupancy"] == 16 * 16
     assert counts["clusters_xy"] == 2
     assert counts["lattice_xy"] >= 2
@@ -145,7 +150,68 @@ def test_control_readouts_keep_their_instruments(window, qapp):
     assert window.control_plot.steer_wheel.isVisible()
 
 
-def test_schema_settings_and_plugin_browser_build(window, qapp):
+def test_gmm_and_gp_prediction_geometry():
+    from avlite.c10_perception.c11_perception_model import AgentState, GMM, GP, State
+    from avlite.plugins.avlite_QT5.plot_widgets import _ellipse_steps, _prediction_drawings
+
+    ego = State(x=0.0, y=0.0, theta=0.0)
+    ahead = AgentState(x=10.0, y=0.0, velocity=5.0, theta=0.0, agent_id=3)
+    steps = np.stack([np.linspace(10.0, 16.0, 20), np.zeros(20)], axis=1)
+    gp = GP(means={3: steps}, covariance={3: np.eye(40) * 0.25})
+    lines, rings = _prediction_drawings(gp, [ahead], ego)
+    assert len(lines) == 1
+    assert lines[0][1][:3] == (255, 140, 0)
+    assert lines[0][1][3] == 1.0
+    assert len(rings) == len(_ellipse_steps(20, 0.1)) * 2
+    assert {round(item[1][3], 2) for item in rings} == {0.5, 0.95}
+
+    modes = np.stack([steps, steps + np.array([0.0, 1.0])])
+    cov = np.tile(np.eye(2) * 0.25, (20, 1, 1))
+    gmm = GMM(
+        trajectories={3: modes},
+        covariances={3: np.stack([cov, cov])},
+        weights={3: np.array([0.25, 0.75])},
+    )
+    lines, rings = _prediction_drawings(gmm, [ahead], ego)
+    assert len(lines) == 2
+    assert {round(item[1][3], 2) for item in lines} == {0.25, 0.75}
+    assert len(rings) == len(_ellipse_steps(20, 0.1)) * 4
+
+    behind = AgentState(x=-8.0, y=0.0, velocity=5.0, theta=0.0, agent_id=3)
+    lines, _rings = _prediction_drawings(gp, [behind], ego)
+    assert lines[0][1][:3] == (147, 112, 219)
+
+
+def test_constant_velocity_gmm_and_gp_paint(window):
+    from avlite.c10_perception.c11_perception_model import AgentState
+    from avlite.c10_perception.c15_perception_algs import ConstantVelocityGMM, ConstantVelocityGP
+
+    window.setting.p67_show_local_global_view.set(True)
+    window.setting.p67_show_prediction.set(True)
+    ego = window.exec.ego_state
+    window.exec.pm.agent_vehicles = [
+        AgentState(
+            x=float(ego.x) + 18.0, y=float(ego.y) + 1.5,
+            theta=float(ego.theta), velocity=8.0, agent_id=7,
+        ),
+    ]
+    ConstantVelocityGMM().predict(window.exec.pm)
+    window.update_ui()
+    counts = window.local_plot.layer_point_counts
+    assert counts["prediction_xy"] > 20
+    assert counts["prediction_ellipses"] > counts["prediction_xy"]
+    ConstantVelocityGP().predict(window.exec.pm)
+    window.update_ui()
+    counts = window.local_plot.layer_point_counts
+    assert counts["prediction_xy"] > 10
+    assert counts["prediction_ellipses"] > 0
+
+
+def _table_names(table):
+    return [table.item(row, 0).text() for row in range(table.rowCount())]
+
+
+def test_schema_settings_and_plugin_browser_build(window, qapp, monkeypatch):
     from avlite.c10_perception.c19_settings import PerceptionSettings
     from avlite.plugins.avlite_QT5.plugin_browser import _Browser
     from avlite.plugins.avlite_QT5.qt_binding import import_qt
@@ -170,12 +236,67 @@ def test_schema_settings_and_plugin_browser_build(window, qapp):
         PerceptionSettings.c11_max_agents = original
         dlg.win.close()
 
+    from avlite.c60_apps.c69_settings import AppSettings
+    from avlite.plugins.p60_visualizer_tk import p63_plugins_app as plugins
+
+    sample = {
+        "name": "sample-plugin",
+        "display_name": "Sample Plugin",
+        "author": "Ada",
+        "version": "1.2.3",
+        "category": "perception",
+        "description": "A sample",
+        "repository": "https://github.com/example/sample-plugin",
+    }
+    monkeypatch.setattr(plugins._PluginOperations, "fetch_registry", lambda **_kwargs: [sample])
+    calls = []
+    monkeypatch.setattr(
+        plugins._PluginOperations, "install_plugin",
+        lambda entry, plugins_dir, token=None: calls.append(("install", entry["name"])) or "/tmp/sample-plugin",
+    )
+    monkeypatch.setattr(
+        plugins._PluginOperations, "register_in_profile",
+        lambda name, path, profile=None, private=False: calls.append(("register", name, str(path))),
+    )
+
+    import time
+
     browser = _Browser(window, QtCore, QtWidgets)
+    browser.notify = lambda: calls.append("notify")
     browser.win.show()
-    qapp.processEvents()
+    table = browser.win.findChild(QtWidgets.QTableWidget, "communityTable")
+    names = []
+    for _ in range(50):
+        qapp.processEvents()
+        names = _table_names(table)
+        if "Sample Plugin" in names and "avlite-QT5" in names:
+            break
+        time.sleep(0.02)
     try:
-        assert browser.win.findChild(QtWidgets.QListWidget, "communityPlugins") is not None
-        assert browser.community.count() >= 1
-        assert browser.win.findChild(QtWidgets.QPushButton, "addCommunityPlugin") is not None
+        assert table.columnCount() == 7
+        assert [table.horizontalHeaderItem(col).text() for col in range(7)] == [
+            "Name", "Category", "Author", "Version", "Status", "Update", "Path",
+        ]
+        assert "avlite-QT5" in names
+        assert "Sample Plugin" in names
+        sample_row = names.index("Sample Plugin")
+        assert table.item(sample_row, 2).text() == "Ada"
+        assert table.item(sample_row, 3).text() == "1.2.3"
+        assert table.item(sample_row, 4).text() == "Available"
+        table.selectRow(sample_row)
+        qapp.processEvents()
+        assert browser.win.findChild(QtWidgets.QPushButton, "btnInstall").isEnabled()
+        assert not browser.win.findChild(QtWidgets.QPushButton, "btnAddProfile").isEnabled()
+        browser.win.findChild(QtWidgets.QPushButton, "btnInstall").click()
+        for _ in range(50):
+            qapp.processEvents()
+            if "notify" in calls:
+                break
+            time.sleep(0.02)
+        assert ("install", "sample-plugin") in calls
+        assert ("register", "sample-plugin", "/tmp/sample-plugin") in calls
+        assert "notify" in calls
+        assert browser.win.findChild(QtWidgets.QPushButton, "btnSignIn") is not None
+        assert "avlite-QT5" in dict(AppSettings.c62_community_plugins or {})
     finally:
         browser.win.close()

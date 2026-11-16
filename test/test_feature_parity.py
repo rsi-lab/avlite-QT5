@@ -54,6 +54,7 @@ def test_global_plan_boundaries(window):
 
 @pytest.mark.requires_data
 def test_local_ego_box(window):
+    window.setting.p67_show_local_global_view.set(True)
     window.update_ui()
     xs, ys = window.local_plot.xy_ego.getData()
     assert len(xs) >= 4 and len(ys) >= 4
@@ -281,6 +282,7 @@ def test_log_panel_clear_and_filter(window):
 
 @pytest.mark.requires_data
 def test_lidar_overlay_after_step(window):
+    window.setting.p67_show_local_global_view.set(True)
     window.setting.p66_show_lidar_global.set(True)
     window.stack_panels.execution.step_exec()
     window.update_ui()
