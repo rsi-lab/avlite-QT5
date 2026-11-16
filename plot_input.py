@@ -45,6 +45,16 @@ def attach_plot_mouse(plot, handler) -> None:
     plot._avlite_mouse_filter = filt
 
 
+def bind_viewport(plot) -> None:
+    """Point the existing mouse filter at the plot's current viewport."""
+    filt = getattr(plot, "_avlite_mouse_filter", None)
+    if filt is None:
+        return
+    viewport = plot.viewport()
+    viewport.removeEventFilter(filt)
+    viewport.installEventFilter(filt)
+
+
 def _view_pos(plot, obj, ev):
     if obj is plot.viewport():
         scene = plot.mapToScene(ev.pos())

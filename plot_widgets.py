@@ -678,6 +678,98 @@ def _set_equal_view(plot, cx: float, cy: float, half_x: float) -> tuple[float, f
         plot.setRange(xRange=(x0, x1), yRange=(y0, y1), padding=0.0, disableAutoRange=True)
     return window
 
+
+def place_panes(splitter, hold, wanted) -> None:
+    """Show *wanted* in *splitter* and park the rest on *hold*.
+
+    A hidden pane left in the splitter is realized at 0×0. Its OpenGL
+    viewport never receives a context, so the next time it opens the
+    curves do not paint.
+    """
+    wanted = list(wanted)
+    current = [splitter.widget(i) for i in range(splitter.count())]
+    if current == wanted and all(not widget.isHidden() for widget in wanted):
+        return
+    splitter.blockSignals(True)
+    try:
+        for index, widget in enumerate(wanted):
+            if splitter.indexOf(widget) != index:
+                splitter.insertWidget(index, widget)
+            widget.show()
+        while splitter.count() > len(wanted):
+            extra = splitter.widget(len(wanted))
+            extra.hide()
+            extra.setParent(hold)
+    finally:
+        splitter.blockSignals(False)
+
+
+def note_plot_surface(plot) -> None:
+    """The viewport must be recreated on the next restore."""
+    plot._avlite_gl_dirty = True
+
+
+def restore_plot_surface(plot) -> str:
+    """Recreate a plot's OpenGL viewport when its context or size is stale.
+
+    Returns ``pending`` when the widget has no size yet, ``rebuilt`` after a
+    new viewport is installed, and ``ready`` when nothing needed to change.
+    Software rendering returns ``ready`` without touching the viewport.
+    """
+    import os
+
+    import pyqtgraph as pg
+
+    if os.environ.get("AVLITE_QT_NO_OPENGL") == "1" or not pg.getConfigOption("useOpenGL"):
+        return "ready"
+    if plot.isHidden():
+        return "ready"
+    if plot.width() < 2 or plot.height() < 2 or getattr(plot, "_avlite_gl_busy", False):
+        return "pending"
+    size = (int(plot.width()), int(plot.height()))
+    viewport = plot.viewport()
+    context = viewport.context() if hasattr(viewport, "context") else None
+    alive = context is not None and context.isValid()
+    dirty = bool(getattr(plot, "_avlite_gl_dirty", False))
+    if alive and not dirty and getattr(plot, "_avlite_gl_size", None) == size:
+        return "ready"
+
+    def release() -> None:
+        scene = plot.scene()
+        if scene is None:
+            return
+        for item in scene.items():
+            state = getattr(item, "glstate", None)
+            if state is None:
+                continue
+            item.glstate = None
+            try:
+                item.sigPlotChanged.disconnect(state.verticesChanged)
+            except (RuntimeError, TypeError):
+                pass
+
+    plot._avlite_gl_busy = True
+    try:
+        # useOpenGL(True) is a no-op while the viewport is already a GL widget,
+        # so the dead context is only replaced by tearing it down first.
+        # setViewport paints during that swap and can reattach a glstate whose
+        # C++ object is then destroyed with the old viewport.
+        plot.useOpenGL(False)
+        release()
+        plot.useOpenGL(True)
+        release()
+        plot._avlite_gl_dirty = False
+        plot._avlite_gl_size = (int(plot.width()), int(plot.height()))
+        plot._avlite_range = None
+        plot._avlite_aspect = None
+        from .plot_input import bind_viewport
+
+        bind_viewport(plot)
+    finally:
+        plot._avlite_gl_busy = False
+    return "rebuilt"
+
+
 _WIDGETS_READY = False
 
 
@@ -1461,6 +1553,8 @@ def _install_widgets() -> None:
             self.panes.setChildrenCollapsible(True)
             self.panes.addWidget(self.xy_plot)
             self.panes.addWidget(self.frenet_plot)
+            self.hold = QtWidgets.QWidget(self)
+            self.hold.hide()
             layout.addWidget(self.panes, 1)
             self.legend = QtWidgets.QLabel(
                 "orange/tan boundary · cyan track · gray plan · red local plan · "
@@ -1664,8 +1758,12 @@ def _install_widgets() -> None:
             if self._vis_flags == flags:
                 return
             self._vis_flags = flags
-            self.xy_plot.setVisible(flags[0])
-            self.frenet_plot.setVisible(flags[1])
+            wanted = []
+            if flags[0]:
+                wanted.append(self.xy_plot)
+            if flags[1]:
+                wanted.append(self.frenet_plot)
+            place_panes(self.panes, self.hold, wanted)
             self.legend.setVisible(flags[2])
 
         def _status(self, text: str) -> None:
