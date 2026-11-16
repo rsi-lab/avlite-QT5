@@ -181,7 +181,12 @@ def _install_panels() -> None:
             layout.addWidget(self.perception.state_lbl)
 
             self.execution = ExecutionPanel(root)
-            layout.addWidget(self.execution)
+            band = QtWidgets.QHBoxLayout()
+            band.setContentsMargins(0, 0, 0, 0)
+            band.setSpacing(4)
+            band.addWidget(self.execution, 3)
+            band.addWidget(self.execution.bridge_panel, 2)
+            layout.addLayout(band)
 
         def refresh(self) -> None:
             self.perception.refresh()
@@ -628,15 +633,20 @@ def _install_panels() -> None:
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
             top.addWidget(self.executer)
-            top.addWidget(QtWidgets.QLabel("Bridge"))
-            self.bridge = _combo(
-                self, root.setting.execution_bridge, choices["bridge"],
-                on_change=lambda: root.reload_stack(reload_code=False),
-            )
-            top.addWidget(self.bridge)
             from avlite.c40_execution.c41_world_bridge import WorldBridge
 
-            top.addWidget(_info_button(self, self.bridge, WorldBridge.registry, bridge=True))
+            self.bridge_panel = QtWidgets.QGroupBox("World Bridge", root.win)
+            self.bridge_panel.setObjectName("worldBridge")
+            bridge_layout = QtWidgets.QVBoxLayout(self.bridge_panel)
+            bridge_row = QtWidgets.QHBoxLayout()
+            self.bridge = _combo(
+                self.bridge_panel, root.setting.execution_bridge, choices["bridge"],
+                on_change=lambda: root.reload_stack(reload_code=False),
+            )
+            self.bridge.setObjectName("bridgeCombo")
+            bridge_row.addWidget(self.bridge, 1)
+            bridge_row.addWidget(_info_button(self, self.bridge, WorldBridge.registry, bridge=True))
+            bridge_layout.addLayout(bridge_row)
             top.addWidget(_check(self, "Perception", root.setting.exec_perceive))
             top.addWidget(_check(self, "Planning", root.setting.exec_plan))
             top.addWidget(_check(self, "Control", root.setting.exec_control))
@@ -689,7 +699,7 @@ def _install_panels() -> None:
             self.cap_label = QtWidgets.QLabel("caps: —")
             self.cap_label.setObjectName("capLabel")
             pin_fluid_readout(self.cap_label)
-            v.addWidget(self.cap_label)
+            bridge_layout.addWidget(self.cap_label)
             self.cap_box = QtWidgets.QWidget()
             self.cap_box.setObjectName("capabilityPanel")
             self.cap_box.setMaximumHeight(36)
@@ -705,7 +715,8 @@ def _install_panels() -> None:
             self.stack_cap_layout.setContentsMargins(0, 0, 0, 0)
             cap_row.addWidget(self.world_cap_host, 1)
             cap_row.addWidget(self.stack_cap_host, 1)
-            v.addWidget(self.cap_box)
+            bridge_layout.addWidget(self.cap_box)
+            bridge_layout.addStretch(1)
             self._cap_key = None
             self._world_checks = []
             self._stack_checks = []
@@ -745,7 +756,10 @@ def _install_panels() -> None:
             v.addWidget(self.task_host)
 
             stats = QtWidgets.QHBoxLayout()
-            self.stats_lbl = QtWidgets.QLabel("real=    0.00  sim=    0.00  perc=    0.0  plan=    0.0  ctrl=    0.0  ui=    0.0 Hz  plot=    0.0 ms")
+            self.stats_lbl = QtWidgets.QLabel(
+                "real=    0.00  sim=    0.00  perc=    0.0 FPS  plan=    0.0 FPS  "
+                "ctrl=    0.0 FPS  ui=    0.0 FPS  plot=    0.0 ms"
+            )
             self.stats_lbl.setObjectName("execStats")
             pin_fluid_readout(self.stats_lbl)
             stats.addWidget(self.stats_lbl, 1)
@@ -761,8 +775,9 @@ def _install_panels() -> None:
             s = self.root.setting
             self.stats_lbl.setText(
                 f"real={s.elapsed_real_time.get()}  sim={s.elapsed_sim_time.get()}  "
-                f"perc={s.perception_fps.get()}  plan={s.replan_fps.get()}  ctrl={s.control_fps.get()}  "
-                f"ui={s.ui_fps.get()} Hz  plot={s.plot_latency_ms.get()} ms"
+                f"perc={s.perception_fps.get()} FPS  plan={s.replan_fps.get()} FPS  "
+                f"ctrl={s.control_fps.get()} FPS  ui={s.ui_fps.get()} FPS  "
+                f"plot={s.plot_latency_ms.get()} ms"
             )
 
         def _pick_file(self, edit, var) -> None:

@@ -38,10 +38,25 @@ def import_qt():
 def import_pyqtgraph(*, use_opengl: bool | None = None):
     """Import and configure pyqtgraph for high-FPS PlotWidget updates."""
     configure_qt_env()
-    import pyqtgraph as pg
-
     if use_opengl is None:
         use_opengl = os.environ.get("AVLITE_QT_NO_OPENGL") != "1"
+    if use_opengl:
+        from PyQt5 import QtCore, QtGui, QtWidgets
+
+        # Several plot viewports are QOpenGLWidgets. They only keep a context
+        # across hide/show when contexts are shared, and the format has to be
+        # chosen before the application exists.
+        if QtWidgets.QApplication.instance() is None:
+            QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
+            fmt = QtGui.QSurfaceFormat()
+            fmt.setRenderableType(QtGui.QSurfaceFormat.OpenGL)
+            fmt.setVersion(2, 1)
+            fmt.setProfile(QtGui.QSurfaceFormat.CompatibilityProfile)
+            fmt.setDepthBufferSize(24)
+            fmt.setStencilBufferSize(8)
+            fmt.setSamples(0)
+            QtGui.QSurfaceFormat.setDefaultFormat(fmt)
+    import pyqtgraph as pg
     # Software antialiasing rasterizes every segment on the CPU when OpenGL is
     # off (the Xvfb / test path). Static layers are cached; leave AA off so a
     # camera pan does not restroke the whole lap.

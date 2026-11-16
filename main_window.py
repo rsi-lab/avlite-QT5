@@ -61,6 +61,8 @@ class VisualizerQtWindow:
         from .control_plot import ControlPlot
         from .plot_widgets import GlobalPlotWidget, LocalPlotWidget
 
+        self.plot_hold = QtWidgets.QWidget(central)
+        self.plot_hold.hide()
         self.plots_splitter = QtWidgets.QSplitter()
         self.plots_splitter.setChildrenCollapsible(False)
         self.local_plot = LocalPlotWidget(self)
@@ -225,6 +227,7 @@ class VisualizerQtWindow:
         self.app.processEvents()
         self._apply_plot_sashes()
         self._sashes_ready = True
+        self._schedule_plot_surfaces()
 
     def exec_app(self) -> int:
         self.show()
@@ -588,12 +591,21 @@ class VisualizerQtWindow:
         self.update_views()
 
     def update_views(self) -> None:
+        from .plot_widgets import place_panes
+
         show_g = bool(self.setting.p67_global_plan_view.get())
         show_l = bool(self.setting.local_plan_view_enabled())
         show_c = bool(self.setting.p67_show_control_view.get())
-        self.global_plot.setVisible(show_g)
-        self.local_plot.setVisible(show_l)
-        self.control_plot.setVisible(show_c)
+        wanted = []
+        if show_l:
+            wanted.append(self.local_plot)
+        if show_g:
+            wanted.append(self.global_plot)
+        if show_c:
+            wanted.append(self.control_plot)
+        place_panes(self.plots_splitter, self.plot_hold, wanted)
+        for index in range(self.plots_splitter.count()):
+            self.plots_splitter.setStretchFactor(index, 1)
         self.local_plot.update_visibility()
         self._apply_plot_sashes()
         hide_menu = bool(getattr(self.setting.schema, "p60_hide_menubar", False))
@@ -601,32 +613,85 @@ class VisualizerQtWindow:
         if hasattr(self, "config_bar"):
             self.config_bar.sync_from_settings()
         self.update_shortcut_mode()
+        self._schedule_plot_surfaces()
+
+    def _schedule_plot_surfaces(self) -> None:
+        """Rebuild OpenGL viewports after a pane is shown or resized.
+
+        A plot created while it was hidden has no GL context. Hiding a sibling
+        QOpenGLWidget also drops the curve state the panes that stay open still
+        hold. Paint then throws and the area stays the clear color.
+        """
+        import os
+
+        if os.environ.get("AVLITE_QT_NO_OPENGL") == "1":
+            return
+        import pyqtgraph as pg
+
+        if not pg.getConfigOption("useOpenGL"):
+            return
+        from .plot_widgets import note_plot_surface
+
+        for plot in (self.local_plot.xy_plot, self.local_plot.frenet_plot, self.global_plot):
+            note_plot_surface(plot)
+        self.QtCore.QTimer.singleShot(0, self._restore_plot_surfaces)
+
+    def _restore_plot_surfaces(self, attempt: int = 0) -> None:
+        from .plot_widgets import restore_plot_surface
+
+        pending = False
+        rebuilt = False
+        for plot in (self.local_plot.xy_plot, self.local_plot.frenet_plot, self.global_plot):
+            state = restore_plot_surface(plot)
+            pending = pending or state == "pending"
+            rebuilt = rebuilt or state == "rebuilt"
+        if pending and attempt < 8:
+            self.QtCore.QTimer.singleShot(
+                0, lambda attempt=attempt: self._restore_plot_surfaces(attempt + 1)
+            )
+            return
+        if rebuilt and attempt < 3:
+            self.QtCore.QTimer.singleShot(
+                0, lambda attempt=attempt: self._restore_plot_surfaces(attempt + 1)
+            )
+            return
+        bg = self.setting.p60_bg_color
+        fg = self.setting.p60_fg_color
+        self.local_plot.update_theme(bg, fg)
+        self.global_plot.update_theme(bg, fg)
+        self.update_ui()
 
     def _save_plot_sashes(self, *_args) -> None:
         if not self._sashes_ready or not self.win.isVisible():
             return
         # Profiles store Tk class names. The two local views share one outer pane,
         # so their shares are that pane split by the inner sash.
-        outer = list(self.plots_splitter.sizes())
-        if len(outer) != 3:
+        splitter = self.plots_splitter
+        outer = list(splitter.sizes())
+        widgets = [splitter.widget(i) for i in range(splitter.count())]
+        if len(outer) != len(widgets):
             return
         parts: list[tuple[str, float]] = []
-        local_px = float(outer[0]) if self.local_plot.isVisible() else 0.0
-        xy_on = not self.local_plot.xy_plot.isHidden()
-        fr_on = not self.local_plot.frenet_plot.isHidden()
-        inner = list(self.local_plot.panes.sizes()) if xy_on and fr_on else []
-        inner_sum = float(sum(inner))
-        if xy_on and fr_on and inner_sum > 0:
-            parts.append(("LocalGlobalPlot", local_px * inner[0] / inner_sum))
-            parts.append(("FrenetPlot", local_px * inner[1] / inner_sum))
-        elif xy_on:
-            parts.append(("LocalGlobalPlot", local_px))
-        elif fr_on:
-            parts.append(("FrenetPlot", local_px))
-        if self.global_plot.isVisible() and outer[1] > 0:
-            parts.append(("GlobalPlanPlot", float(outer[1])))
-        if self.control_plot.isVisible() and outer[2] > 0:
-            parts.append(("ControlPlot", float(outer[2])))
+        for widget, px in zip(widgets, outer):
+            if px <= 0:
+                continue
+            if widget is self.local_plot:
+                xy_on = not self.local_plot.xy_plot.isHidden()
+                fr_on = not self.local_plot.frenet_plot.isHidden()
+                inner = list(self.local_plot.panes.sizes())
+                inner_sum = float(sum(inner))
+                local_px = float(px)
+                if xy_on and fr_on and len(inner) == 2 and inner_sum > 0:
+                    parts.append(("LocalGlobalPlot", local_px * inner[0] / inner_sum))
+                    parts.append(("FrenetPlot", local_px * inner[1] / inner_sum))
+                elif xy_on:
+                    parts.append(("LocalGlobalPlot", local_px))
+                elif fr_on:
+                    parts.append(("FrenetPlot", local_px))
+            elif widget is self.global_plot:
+                parts.append(("GlobalPlanPlot", float(px)))
+            elif widget is self.control_plot:
+                parts.append(("ControlPlot", float(px)))
         if not 2 <= len(parts) <= 4:
             return
         total = sum(px for _name, px in parts)
@@ -638,39 +703,38 @@ class VisualizerQtWindow:
         from .setting_model import plot_fractions
 
         fractions = plot_fractions(self.setting)
-        total = sum(self.plots_splitter.sizes())
+        splitter = self.plots_splitter
+        total = sum(splitter.sizes())
         if total <= 1 or not fractions:
             return
         local_names = [name for name in ("LocalGlobalPlot", "FrenetPlot") if name in fractions]
         local_frac = sum(fractions[name] for name in local_names)
-
-        def pixels(share: float) -> int:
-            return 0 if share <= 0 else max(1, int(round(share * total)))
-
-        sizes = [
-            pixels(local_frac),
-            pixels(fractions.get("GlobalPlanPlot", 0.0)),
-            pixels(fractions.get("ControlPlot", 0.0)),
-        ]
-        if sizes != list(self.plots_splitter.sizes()):
-            self.plots_splitter.blockSignals(True)
-            self.plots_splitter.setSizes(sizes)
-            self.plots_splitter.blockSignals(False)
-        inner_total = sum(self.local_plot.panes.sizes()) or max(self.local_plot.width(), 1)
-        if len(local_names) == 2:
-            left_share = fractions["LocalGlobalPlot"] / local_frac
-            left = max(1, int(round(left_share * inner_total)))
-            inner = [left, max(1, inner_total - left)]
-        elif local_names == ["LocalGlobalPlot"]:
-            inner = [inner_total, 0]
-        elif local_names == ["FrenetPlot"]:
-            inner = [0, inner_total]
-        else:
+        widgets = [splitter.widget(i) for i in range(splitter.count())]
+        shares = []
+        for widget in widgets:
+            if widget is self.local_plot:
+                shares.append(local_frac)
+            elif widget is self.global_plot:
+                shares.append(fractions.get("GlobalPlanPlot", 0.0))
+            else:
+                shares.append(fractions.get("ControlPlot", 0.0))
+        sizes = [0 if share <= 0 else max(1, int(round(share * total))) for share in shares]
+        if sizes and sum(sizes) != total:
+            sizes[-1] = max(1, sizes[-1] + total - sum(sizes))
+        if sizes != list(splitter.sizes()):
+            splitter.blockSignals(True)
+            splitter.setSizes(sizes)
+            splitter.blockSignals(False)
+        panes = self.local_plot.panes
+        if panes.count() != 2 or len(local_names) < 2 or local_frac <= 0 or self.local_plot.isHidden():
             return
-        if inner != list(self.local_plot.panes.sizes()):
-            self.local_plot.panes.blockSignals(True)
-            self.local_plot.panes.setSizes(inner)
-            self.local_plot.panes.blockSignals(False)
+        inner_total = max(sum(panes.sizes()), self.local_plot.width(), 1)
+        left = max(1, int(round(fractions["LocalGlobalPlot"] / local_frac * inner_total)))
+        inner = [left, max(1, inner_total - left)]
+        if inner != list(panes.sizes()):
+            panes.blockSignals(True)
+            panes.setSizes(inner)
+            panes.blockSignals(False)
 
     def local_plan_view_enabled(self) -> bool:
         return self.setting.local_plan_view_enabled()
