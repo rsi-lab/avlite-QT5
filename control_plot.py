@@ -573,15 +573,6 @@ def _install() -> None:
                 painter.setPen(QtGui.QPen(colors["ink"], max(1.0, min(2.0, dial / 96.0))))
                 painter.setBrush(QtCore.Qt.NoBrush)
                 painter.drawPath(path)
-            if self.trail:
-                lateral, longitudinal = self.trail[-1]
-                painter.setPen(QtCore.Qt.NoPen)
-                painter.setBrush(colors["now"])
-                painter.drawEllipse(
-                    QtCore.QPointF(cx + lateral / span * radius, cy - longitudinal / span * radius),
-                    min(6.0, max(3.0, 4.0 * dial / 96.0)),
-                    min(6.0, max(3.0, 4.0 * dial / 96.0)),
-                )
             # A plate breaks the ring and the trail behind each number. The stroke used to run through the glyph.
             drawn = []
             for text, rect, faint in items:
@@ -591,6 +582,15 @@ def _install() -> None:
                 painter.setPen(colors["faint"] if faint else colors["ink"])
                 drawn.append(_draw_centered(painter, font, text, rect.center().x(), rect.center().y()))
             self.label_rects = drawn
+            if self.trail:
+                lateral, longitudinal = self.trail[-1]
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(colors["now"])
+                painter.drawEllipse(
+                    QtCore.QPointF(cx + lateral / span * radius, cy - longitudinal / span * radius),
+                    min(6.0, max(3.0, 4.0 * dial / 96.0)),
+                    min(6.0, max(3.0, 4.0 * dial / 96.0)),
+                )
 
     class ControlPlot(QtWidgets.QWidget):
         """One pane: speed, steer, and g-g, sharing a circle size."""
