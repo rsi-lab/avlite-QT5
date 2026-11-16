@@ -409,9 +409,13 @@ def _local_plan_paths(lp) -> list[np.ndarray]:
 
 
 def _velocity_colors(speed: np.ndarray, scale: str) -> list[tuple[int, int, int, int]]:
+    """Tk's raceline: slow is #39ff14, mid is #ffd700, fast is #dc143c."""
     v = np.asarray(speed, dtype=float)
     if scale == "absolute":
-        t = np.clip(v / 30.0, 0.0, 1.0)
+        from avlite.c30_control.c39_settings import ControlSettings
+
+        vmax = float(ControlSettings.c32_ego_max_velocity)
+        t = np.clip(v / vmax, 0.0, 1.0) if vmax > 0.0 else np.zeros_like(v)
     else:
         finite = v[np.isfinite(v)]
         if len(finite) == 0 or float(np.max(finite) - np.min(finite)) < 1e-6:
@@ -419,11 +423,17 @@ def _velocity_colors(speed: np.ndarray, scale: str) -> list[tuple[int, int, int,
         else:
             lo, hi = float(np.min(finite)), float(np.max(finite))
             t = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
+    t = np.where(np.isfinite(v), t, np.nan)
     u = np.asarray(t, dtype=float)
-    r = (40 + 215 * u).astype(np.int32)
-    g = (80 + 140 * (1.0 - np.abs(u - 0.5) * 2.0)).astype(np.int32)
-    b = (220 * (1.0 - u)).astype(np.int32)
-    colors = np.column_stack([r, g, b, np.full(u.shape, 230, dtype=np.int32)])
+    slow = np.array([57, 255, 20], dtype=float)
+    mid = np.array([255, 215, 0], dtype=float)
+    fast = np.array([220, 20, 60], dtype=float)
+    left = np.where(u[:, None] < 0.5, slow, mid)
+    right = np.where(u[:, None] < 0.5, mid, fast)
+    mix = np.where(u < 0.5, u / 0.5, (u - 0.5) / 0.5)
+    rgb = left * (1.0 - mix[:, None]) + right * mix[:, None]
+    rgb = np.where(np.isfinite(rgb), rgb, 0.0)
+    colors = np.column_stack([np.rint(rgb).astype(np.int32), np.full(u.shape, 255, dtype=np.int32)])
     colors[~np.isfinite(u)] = (80, 80, 80, 0)
     return [tuple(int(c) for c in row) for row in colors]
 
@@ -795,6 +805,54 @@ def _install_widgets() -> None:
         def boundingRect(self):
             return self._bounds
 
+    class _VelocityLine(pg.GraphicsObject):
+        """One green-yellow-red raceline. Tk draws this as a width-5 collection."""
+
+        def __init__(self):
+            super().__init__()
+            self._segs: list = []
+            self._bounds = QtCore.QRectF()
+
+        def clear(self) -> None:
+            self.set_segments([], [], [])
+
+        def set_segments(self, xs, ys, colors) -> None:
+            self.prepareGeometryChange()
+            xa = np.asarray(xs, dtype=float).ravel()
+            ya = np.asarray(ys, dtype=float).ravel()
+            n = min(int(xa.size), int(ya.size), len(colors))
+            segs = []
+            for i in range(max(0, n - 1)):
+                if not (np.isfinite(xa[i]) and np.isfinite(ya[i]) and np.isfinite(xa[i + 1]) and np.isfinite(ya[i + 1])):
+                    continue
+                segs.append((float(xa[i]), float(ya[i]), float(xa[i + 1]), float(ya[i + 1]), colors[i]))
+            self._segs = segs
+            if segs:
+                xs_all = [seg[0] for seg in segs] + [segs[-1][2]]
+                ys_all = [seg[1] for seg in segs] + [segs[-1][3]]
+                self._bounds = QtCore.QRectF(
+                    min(xs_all), min(ys_all),
+                    max(xs_all) - min(xs_all) or 1.0,
+                    max(ys_all) - min(ys_all) or 1.0,
+                )
+            else:
+                self._bounds = QtCore.QRectF()
+            self.update()
+
+        def paint(self, painter, *args) -> None:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+            for x0, y0, x1, y1, color in self._segs:
+                red, green, blue, alpha = color
+                pen = QtGui.QPen(QtGui.QColor(int(red), int(green), int(blue), int(alpha)))
+                pen.setCosmetic(True)
+                pen.setWidthF(5.0)
+                pen.setCapStyle(QtCore.Qt.FlatCap)
+                painter.setPen(pen)
+                painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
+
+        def boundingRect(self):
+            return self._bounds
+
     def _theme_plot(plot, bg: str, fg: str) -> None:
         """Match Tk: plot face, axis line, tick text, and axis title use the theme."""
         plot.setBackground(bg)
@@ -811,7 +869,7 @@ def _install_widgets() -> None:
             self.root = root
             self.setLabel("bottom", "x (m)")
             self.setLabel("left", "y (m)")
-            self.showGrid(x=True, y=True, alpha=0.25)
+            # Tk leaves the global axes clear. A grid cuts the velocity-colored raceline.
             self._center_delta = np.array([0.0, 0.0])
             self._map_bounds: Optional[tuple[float, float, float, float]] = None
             self._drag_pan = False
@@ -823,9 +881,14 @@ def _install_widgets() -> None:
             self._hover_plan_xy: Optional[np.ndarray] = None
             self._hover_plan_v: Optional[np.ndarray] = None
 
-            self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2), connect="finite")
-            self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
-            self.global_plan = self.plotItem.plot(pen=pg.mkPen("#4fc3f7", width=3), connect="finite")
+            self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ffa500", width=3), connect="finite")
+            self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=3), connect="finite")
+            # The geometry stays on this curve for callers that read it. The
+            # visible raceline is the green-yellow-red stroke, matching Tk's width 5.
+            self.global_plan = self.plotItem.plot(pen=pg.mkPen(0, 0, 0, 0), connect="finite")
+            self.velocity_line = _VelocityLine()
+            self.velocity_line.setZValue(4)
+            self.addItem(self.velocity_line)
             self.global_plan_speed = pg.ScatterPlotItem(size=7, pen=None, pxMode=True)
             self.addItem(self.global_plan_speed)
             self.hdmap_lanes: list[pg.PlotDataItem] = []
@@ -893,6 +956,7 @@ def _install_widgets() -> None:
             self.hdmap_lanes.clear()
             self._lane_cache.clear()
             self.global_plan_speed.setData([], [])
+            self.velocity_line.clear()
             self.hd_closest.setData([], [])
             self.hd_text.hide()
             self.planner_text.hide()
@@ -1075,24 +1139,60 @@ def _install_widgets() -> None:
             if status is not None:
                 status.set(text)
 
-        def _paint_plan_speed(self, xs, ys, vel) -> None:
+        def _paint_plan_speed(self, xs, ys, vel, window) -> None:
             xs = np.asarray(xs, dtype=float).ravel()
             ys = np.asarray(ys, dtype=float).ravel()
             vel_a = np.asarray([] if vel is None else vel, dtype=float).ravel()
             n = min(int(xs.size), int(ys.size), int(vel_a.size)) if vel_a.size else 0
             if n == 0:
                 _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
+                self.velocity_line.clear()
                 return
-            step = max(1, n // 400)
             scale = str(getattr(self.root.setting.schema, "p66_global_plan_velocity_scale", "relative"))
-            sample = vel_a[:n:max(1, n // 8)]
-            token = (n, step, scale, round(float(np.nansum(sample)), 2))
+            xs, ys, vel_a = xs[:n], ys[:n], vel_a[:n]
+            if window is not None:
+                # A single slice from the first hit to the last joins both ends of
+                # the lap and drags in vertices that are far outside the view.
+                x0, x1, y0, y1 = window
+                mx = (x1 - x0) * 0.15
+                my = (y1 - y0) * 0.15
+                keep = (xs >= x0 - mx) & (xs <= x1 + mx) & (ys >= y0 - my) & (ys <= y1 + my)
+                idx = np.flatnonzero(keep)
+                if idx.size == 0:
+                    _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
+                    self.velocity_line.clear()
+                    return
+                runs = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+                # Stride inside a run. Striding the joined array can skip the NaN
+                # and draw a chord between two pieces of the lap.
+                step = max(1, n // 1500)
+                parts_x, parts_y, parts_v = [], [], []
+                for k, run in enumerate(runs):
+                    a = max(int(run[0]) - 1, 0)
+                    b = min(int(run[-1]) + 2, n)
+                    if k:
+                        parts_x.append(np.array([np.nan]))
+                        parts_y.append(np.array([np.nan]))
+                        parts_v.append(np.array([np.nan]))
+                    parts_x.append(xs[a:b:step])
+                    parts_y.append(ys[a:b:step])
+                    parts_v.append(vel_a[a:b:step])
+                xs = np.concatenate(parts_x)
+                ys = np.concatenate(parts_y)
+                vel_a = np.concatenate(parts_v)
+                n = len(xs)
+                step = 1
+            else:
+                step = max(1, n // 1500)
+            token = (n, step, scale, _window_token(window), round(float(np.nansum(vel_a[::max(1, n // 8)])), 2))
             if self._curve_cache.get("speed") == token:
                 return
             self._curve_cache["speed"] = token
-            colors = _velocity_colors(vel_a[:n:step], scale)
-            brushes = [pg.mkBrush(*c) for c in colors]
-            self.global_plan_speed.setData(xs[:n:step], ys[:n:step], brush=brushes)
+            colors = _velocity_colors(vel_a[::step], scale)
+            self.velocity_line.set_segments(xs[::step], ys[::step], colors)
+            # Tk has no speed dots on top of the stroke. Keep the item empty so
+            # older callers can still ask it for data.
+            self.global_plan_speed.setData([], [])
 
         def _geom_for(self, plan):
             traj = getattr(plan, "trajectory", None) if plan is not None else None
@@ -1282,10 +1382,11 @@ def _install_widgets() -> None:
 
             if setting.p66_show_global_plan.get() and geom is not None and geom["traj"] is not None:
                 _push_windowed(self._curve_cache, self.global_plan, "gp", geom["refx"], geom["refy"], window)
-                self._paint_plan_speed(geom["refx"], geom["refy"], geom["vel"])
+                self._paint_plan_speed(geom["refx"], geom["refy"], geom["vel"], window)
             else:
                 _push_hidden(self._curve_cache, self.global_plan, "gp")
                 _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
+                self.velocity_line.clear()
                 self._hover_plan_xy = None
                 self._hover_plan_v = None
 
@@ -1349,14 +1450,22 @@ def _install_widgets() -> None:
             ):
                 pw.setLabel("bottom", xlabel)
                 pw.setLabel("left", ylabel)
+                pw.setMinimumWidth(0)
                 # Tk leaves these axes clear. A grid cuts through the
                 # translucent forecast rings on the dark plot.
                 _pin_plot_chrome(pw)
-            layout.addWidget(self.xy_plot, 1)
-            layout.addWidget(self.frenet_plot, 1)
+            # Tk puts LocalGlobalPlot and FrenetPlot next to each other.
+            # Stacking them made each one short once both were open.
+            self.panes = QtWidgets.QSplitter()
+            self.panes.setOrientation(QtCore.Qt.Horizontal)
+            self.panes.setChildrenCollapsible(True)
+            self.panes.addWidget(self.xy_plot)
+            self.panes.addWidget(self.frenet_plot)
+            layout.addWidget(self.panes, 1)
             self.legend = QtWidgets.QLabel(
-                "orange/tan boundary · cyan plan · red ego · green past · "
-                "lime lidar · yellow clusters · orange ahead / purple behind prediction · "
+                "orange/tan boundary · cyan track · gray plan · red local plan · "
+                "azure vehicles · green past · lime lidar · yellow clusters · "
+                "orange ahead / purple behind prediction · "
                 "green feasible / blue kinematic / red collision lattice"
             )
             self.legend.setObjectName("plotLegend")
@@ -1391,10 +1500,13 @@ def _install_widgets() -> None:
             attach_plot_mouse(self.frenet_plot, _PaneMouse(self, frenet=True))
 
         def _init_curves(self) -> None:
-            self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2), connect="finite")
+            self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ffa500", width=2), connect="finite")
             self.xy_right = self.xy_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
-            self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#888888", width=2), connect="finite")
-            self.xy_local = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
+            self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#808080", width=2), connect="finite")
+            # Tk's local plan is a wide translucent red stroke, not a thin line.
+            self.xy_local = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen(QtGui.QColor(255, 0, 0, 153), width=8), connect="finite",
+            )
             ego_pen = pg.mkPen(QtGui.QColor(*_EGO_EDGE), width=1.5)
             agent_pen = pg.mkPen(QtGui.QColor(*_AGENT_EDGE), width=1.0)
             self.xy_bodies = _BodyLayer()
@@ -1422,9 +1534,9 @@ def _install_widgets() -> None:
                 pen=pg.mkPen("#4169e1", width=1), connect="finite",
             )
             self.xy_track = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#bdbdbd", width=1), connect="finite",
+                pen=pg.mkPen(QtGui.QColor(0, 255, 255, 128), width=1), connect="finite",
             )
-            self.xy_heading = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=2))
+            self.xy_heading = self.xy_plot.plotItem.plot(pen=pg.mkPen("#2f4f4f", width=1.5))
             self.xy_wp = self.xy_plot.plotItem.plot(
                 pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=12,
             )
@@ -1446,10 +1558,14 @@ def _install_widgets() -> None:
             self.xy_occ.hide()
             self.xy_flow.hide()
 
-            self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=1), connect="finite")
+            self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ffa500", width=1), connect="finite")
             self.sd_right = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=1), connect="finite")
-            self.sd_ref = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#888888", width=1), connect="finite")
-            self.sd_local = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
+            self.sd_ref = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen(QtGui.QColor(128, 128, 128, 128), width=1), connect="finite",
+            )
+            self.sd_local = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen(QtGui.QColor(255, 0, 0, 153), width=8), connect="finite",
+            )
             self.sd_bodies = _BodyLayer()
             self.sd_bodies.setZValue(-1)
             self.frenet_plot.addItem(self.sd_bodies)
@@ -1470,7 +1586,7 @@ def _install_widgets() -> None:
                 pen=pg.mkPen("#4169e1", width=1), connect="finite",
             )
             self.sd_track = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#bdbdbd", width=1), connect="finite",
+                pen=pg.mkPen(QtGui.QColor(0, 255, 255, 128), width=1), connect="finite",
             )
             self.sd_wp = self.frenet_plot.plotItem.plot(
                 pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=12,
@@ -2104,10 +2220,19 @@ def _install_widgets() -> None:
         def _fetch_lidar(self, stack):
             try:
                 frame = stack.world.get_sensor_frame()
-                lidar = getattr(frame, "lidar", None)
+                lidar = frame.get_lidar() if hasattr(frame, "get_lidar") else None
+                if lidar is None:
+                    lidar = getattr(frame, "lidar", None)
                 pts = getattr(lidar, "points", None) if lidar is not None else None
                 if pts is None or len(pts) == 0:
                     return None
+                # The cloud is in the sensor frame. Both plots are in the map
+                # frame; Tk transforms with to_map before drawing or converting to s-d.
+                if hasattr(lidar, "to_map"):
+                    mapped = lidar.to_map(pts, stack.ego_state)
+                    if mapped is None or len(mapped) == 0:
+                        return None
+                    pts = mapped
                 arr = np.asarray(pts, dtype=float)
                 if arr.ndim == 2 and arr.shape[1] >= 2:
                     return np.array(arr[:, :2], copy=True)
@@ -2160,7 +2285,9 @@ def _install_widgets() -> None:
                 self._curve_cache["lidar_sd"] = 0
 
         def _paint_clusters(self, stack, gt, s) -> None:
-            xy = _cluster_xy(stack.pm) if s.p66_show_lidar_clusters.get() and self._xy_on else None
+            # Clusters are map-frame already. A Frenet-only profile still shows them.
+            want_clusters = bool(s.p66_show_lidar_clusters.get()) and (self._xy_on or self._frenet_on)
+            xy = _cluster_xy(stack.pm) if want_clusters else None
             if xy is None or len(xy) == 0:
                 if self._curve_cache.get("clu") != 0:
                     self.xy_clusters.setData([], [])

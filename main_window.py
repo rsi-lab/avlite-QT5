@@ -130,7 +130,10 @@ class VisualizerQtWindow:
         attach_panel_fold(self.shortcut_help, setting.p60_shortcuts_folded, name="foldShortcuts")
         attach_panel_fold(
             panels.perception, setting.p67_perception_folded, name="foldPerception",
-            on_apply=lambda folded: None if folded else panels.perception._update_pipeline_visibility(),
+            on_apply=lambda folded: None if folded else (
+                panels.perception._update_pipeline_visibility(),
+                panels.perception._update_save_map_visibility(),
+            ),
         )
         attach_panel_fold(
             panels.planning, setting.p67_plan_folded, name="foldPlanning",
@@ -155,26 +158,15 @@ class VisualizerQtWindow:
         view_menu = menubar.addMenu("&View")
         act_global = view_menu.addAction("Toggle global plot")
         act_global.triggered.connect(
-            lambda: (
-                self.setting.p67_global_plan_view.set(not self.setting.p67_global_plan_view.get()),
-                self.update_views(),
-            )
+            lambda: self._toggle_named_plot("p67_global_plan_view", "GlobalPlanPlot")
         )
         act_local = view_menu.addAction("Toggle local plot")
         act_local.triggered.connect(
-            lambda: (
-                self.setting.p67_show_local_global_view.set(
-                    not self.setting.p67_show_local_global_view.get()
-                ),
-                self.update_views(),
-            )
+            lambda: self._toggle_named_plot("p67_show_local_global_view", "LocalGlobalPlot")
         )
         act_control = view_menu.addAction("Toggle control plot")
         act_control.triggered.connect(
-            lambda: (
-                self.setting.p67_show_control_view.set(not self.setting.p67_show_control_view.get()),
-                self.update_views(),
-            )
+            lambda: self._toggle_named_plot("p67_show_control_view", "ControlPlot")
         )
         act_dark = view_menu.addAction("Toggle dark mode")
         act_dark.triggered.connect(self._toggle_dark)
@@ -586,6 +578,15 @@ class VisualizerQtWindow:
             self.win, "Update", f"Update available: {__version__} → {latest}",
         )
 
+    def _toggle_named_plot(self, field: str, plot_name: str) -> None:
+        from .setting_model import note_plot_visibility
+
+        var = getattr(self.setting, field)
+        visible = not bool(var.get())
+        var.set(visible)
+        note_plot_visibility(self.setting, plot_name, visible)
+        self.update_views()
+
     def update_views(self) -> None:
         show_g = bool(self.setting.p67_global_plan_view.get())
         show_l = bool(self.setting.local_plan_view_enabled())
@@ -601,59 +602,75 @@ class VisualizerQtWindow:
             self.config_bar.sync_from_settings()
         self.update_shortcut_mode()
 
-    def _plot_children(self) -> list:
-        return [self.local_plot, self.global_plot, self.control_plot]
-
     def _save_plot_sashes(self, *_args) -> None:
         if not self._sashes_ready or not self.win.isVisible():
             return
-        visible = [
-            (child, size)
-            for child, size in zip(self._plot_children(), self.plots_splitter.sizes())
-            if child.isVisible() and size > 0
-        ]
-        if not 2 <= len(visible) <= 4:
+        # Profiles store Tk class names. The two local views share one outer pane,
+        # so their shares are that pane split by the inner sash.
+        outer = list(self.plots_splitter.sizes())
+        if len(outer) != 3:
             return
-        total = sum(size for _child, size in visible)
+        parts: list[tuple[str, float]] = []
+        local_px = float(outer[0]) if self.local_plot.isVisible() else 0.0
+        xy_on = not self.local_plot.xy_plot.isHidden()
+        fr_on = not self.local_plot.frenet_plot.isHidden()
+        inner = list(self.local_plot.panes.sizes()) if xy_on and fr_on else []
+        inner_sum = float(sum(inner))
+        if xy_on and fr_on and inner_sum > 0:
+            parts.append(("LocalGlobalPlot", local_px * inner[0] / inner_sum))
+            parts.append(("FrenetPlot", local_px * inner[1] / inner_sum))
+        elif xy_on:
+            parts.append(("LocalGlobalPlot", local_px))
+        elif fr_on:
+            parts.append(("FrenetPlot", local_px))
+        if self.global_plot.isVisible() and outer[1] > 0:
+            parts.append(("GlobalPlanPlot", float(outer[1])))
+        if self.control_plot.isVisible() and outer[2] > 0:
+            parts.append(("ControlPlot", float(outer[2])))
+        if not 2 <= len(parts) <= 4:
+            return
+        total = sum(px for _name, px in parts)
         if total <= 1:
             return
-        self.setting.p67_plot_sashes = {
-            type(child).__name__: round(size / total, 4) for child, size in visible
-        }
+        self.setting.p67_plot_sashes = {name: round(px / total, 4) for name, px in parts}
 
     def _apply_plot_sashes(self) -> None:
-        children = self._plot_children()
-        visible = [child for child in children if child.isVisible()]
-        names = [type(child).__name__ for child in visible]
-        saved = dict(self.setting.p67_plot_sashes or {})
+        from .setting_model import plot_fractions
+
+        fractions = plot_fractions(self.setting)
         total = sum(self.plots_splitter.sizes())
-        if total <= 1 or not names:
+        if total <= 1 or not fractions:
             return
-        matched = (
-            2 <= len(names) <= 4
-            and set(saved) == set(names)
-            and all(float(saved[name]) > 0 for name in names)
-        )
-        if matched:
-            sizes = [
-                0 if not child.isVisible() else max(1, int(round(float(saved[type(child).__name__]) * total)))
-                for child in children
-            ]
-        elif len(names) >= 2:
-            share, extra = divmod(total, len(names))
-            sizes = []
-            for child in children:
-                if not child.isVisible():
-                    sizes.append(0)
-                    continue
-                sizes.append(share + extra)
-                extra = 0
-        else:
-            return
+        local_names = [name for name in ("LocalGlobalPlot", "FrenetPlot") if name in fractions]
+        local_frac = sum(fractions[name] for name in local_names)
+
+        def pixels(share: float) -> int:
+            return 0 if share <= 0 else max(1, int(round(share * total)))
+
+        sizes = [
+            pixels(local_frac),
+            pixels(fractions.get("GlobalPlanPlot", 0.0)),
+            pixels(fractions.get("ControlPlot", 0.0)),
+        ]
         if sizes != list(self.plots_splitter.sizes()):
             self.plots_splitter.blockSignals(True)
             self.plots_splitter.setSizes(sizes)
             self.plots_splitter.blockSignals(False)
+        inner_total = sum(self.local_plot.panes.sizes()) or max(self.local_plot.width(), 1)
+        if len(local_names) == 2:
+            left_share = fractions["LocalGlobalPlot"] / local_frac
+            left = max(1, int(round(left_share * inner_total)))
+            inner = [left, max(1, inner_total - left)]
+        elif local_names == ["LocalGlobalPlot"]:
+            inner = [inner_total, 0]
+        elif local_names == ["FrenetPlot"]:
+            inner = [0, inner_total]
+        else:
+            return
+        if inner != list(self.local_plot.panes.sizes()):
+            self.local_plot.panes.blockSignals(True)
+            self.local_plot.panes.setSizes(inner)
+            self.local_plot.panes.blockSignals(False)
 
     def local_plan_view_enabled(self) -> bool:
         return self.setting.local_plan_view_enabled()

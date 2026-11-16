@@ -59,6 +59,10 @@ class PluginSettingsSchema(SettingsSchema):
     p67_global_plan_view: bool = Field(default=True, description="Show global plan panel.")
     p67_show_control_view: bool = Field(default=True, description="Show the control plot.")
     p67_local_plan_view: bool = Field(default=True, description="Show local plan panel.")
+    p67_plot_visible: dict = Field(
+        default_factory=dict,
+        description="Open plot panes, keyed by the Tk plot class name.",
+    )
     p67_plot_sashes: dict[str, float] = Field(
         default_factory=dict,
         description="Width fraction of each visible plot pane. Stored for at most 4 panes.",

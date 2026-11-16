@@ -183,29 +183,33 @@ def _install() -> None:
             self.root.setting.p60_dark_mode.set(self._checked(state))
             self.root._apply_theme()
 
+        def _set_plot(self, field: str, plot_name: str, state: int) -> None:
+            from .setting_model import note_plot_visibility
+
+            visible = self._checked(state)
+            getattr(self.root.setting, field).set(visible)
+            note_plot_visibility(self.root.setting, plot_name, visible)
+            self.root.update_views()
+
         def _on_global(self, state: int) -> None:
             if self._syncing:
                 return
-            self.root.setting.p67_global_plan_view.set(self._checked(state))
-            self.root.update_views()
+            self._set_plot("p67_global_plan_view", "GlobalPlanPlot", state)
 
         def _on_frenet(self, state: int) -> None:
             if self._syncing:
                 return
-            self.root.setting.p67_show_local_frenet_view.set(self._checked(state))
-            self.root.update_views()
+            self._set_plot("p67_show_local_frenet_view", "FrenetPlot", state)
 
         def _on_local(self, state: int) -> None:
             if self._syncing:
                 return
-            self.root.setting.p67_show_local_global_view.set(self._checked(state))
-            self.root.update_views()
+            self._set_plot("p67_show_local_global_view", "LocalGlobalPlot", state)
 
         def _on_control(self, state: int) -> None:
             if self._syncing:
                 return
-            self.root.setting.p67_show_control_view.set(self._checked(state))
-            self.root.update_views()
+            self._set_plot("p67_show_control_view", "ControlPlot", state)
 
         def _on_profile(self, name: str) -> None:
             if self._syncing or not name:

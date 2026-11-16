@@ -194,38 +194,78 @@ def _install_panels() -> None:
         def __init__(self, root: "VisualizerQtWindow"):
             super().__init__("Perception")
             self.root = root
-            grid = QtWidgets.QGridLayout(self)
+            # Tk puts Detect/Track/Predict beside the strategy combo, and Map
+            # with Loc on the row under that. A tall form pushed the other panels.
+            outer = QtWidgets.QVBoxLayout(self)
             choices = root.setting.registry_choices()
-            grid.addWidget(QtWidgets.QLabel("Strategy"), 0, 0)
+            top = QtWidgets.QHBoxLayout()
             self.perc = _combo(
                 self, root.setting.perception_type, choices["perception"],
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
-            grid.addWidget(self.perc, 0, 1)
-            from avlite.c10_perception.c12_perception_strategy import PerceptionStrategy
+            top.addWidget(self.perc, 1)
+            from avlite.c10_perception.c12_perception_strategy import (
+                DetectionStrategy,
+                PerceptionStrategy,
+                PredictionStrategy,
+                TrackingStrategy,
+            )
 
-            grid.addWidget(_info_button(self, self.perc, PerceptionStrategy.registry), 0, 2)
+            top.addWidget(_info_button(self, self.perc, PerceptionStrategy.registry))
+            self._pipe = QtWidgets.QWidget()
+            pipe = QtWidgets.QGridLayout(self._pipe)
+            pipe.setContentsMargins(0, 0, 0, 0)
             self.det = _combo(self, root.setting.detection_strategy_type, choices["detection"], root.refresh_pipeline)
             self.trk = _combo(self, root.setting.tracking_strategy_type, choices["tracking"], root.refresh_pipeline)
             self.prd = _combo(self, root.setting.prediction_strategy_type, choices["prediction"], root.refresh_pipeline)
-            self.lbl_detect = _named_row(grid, 1, "Detect", self.det, "detect")
-            self.lbl_track = _named_row(grid, 2, "Track", self.trk, "track")
-            self.lbl_predict = _named_row(grid, 3, "Predict", self.prd, "predict")
+            self.lbl_detect = _named_row(pipe, 0, "Detect:", self.det, "detect")
+            self.lbl_track = _named_row(pipe, 1, "Track:", self.trk, "track")
+            self.lbl_predict = _named_row(pipe, 2, "Predict:", self.prd, "predict")
+            det_info = _info_button(self, self.det, DetectionStrategy.registry)
+            trk_info = _info_button(self, self.trk, TrackingStrategy.registry)
+            prd_info = _info_button(self, self.prd, PredictionStrategy.registry)
+            pipe.addWidget(det_info, 0, 2)
+            pipe.addWidget(trk_info, 1, 2)
+            pipe.addWidget(prd_info, 2, 2)
+            top.addWidget(self._pipe, 2)
+            top.setAlignment(QtCore.Qt.AlignTop)
+            outer.addLayout(top)
             self._pipeline_rows = (
-                self.lbl_detect, self.det, self.lbl_track, self.trk, self.lbl_predict, self.prd,
+                self._pipe,
+                self.lbl_detect, self.det, det_info,
+                self.lbl_track, self.trk, trk_info,
+                self.lbl_predict, self.prd, prd_info,
             )
-            grid.addWidget(QtWidgets.QLabel("Map"), 4, 0)
+            bottom = QtWidgets.QHBoxLayout()
+            bottom.addWidget(QtWidgets.QLabel("Map:"))
             self.mapping = _combo(
                 self, root.setting.mapping_type, choices["mapping"],
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
-            grid.addWidget(self.mapping, 4, 1)
-            grid.addWidget(QtWidgets.QLabel("Loc"), 5, 0)
+            bottom.addWidget(self.mapping, 1)
+            from avlite.c10_perception.c14_mapping_strategy import MappingStrategy
+            from avlite.c10_perception.c17_mapping_algs import OccupancyMapper
+
+            bottom.addWidget(_info_button(self, self.mapping, MappingStrategy.registry))
+            # Tk's save control sits on this row and only exists for OccupancyMapper.
+            self.save_occ = QtWidgets.QPushButton("⬇")
+            self.save_occ.setFixedWidth(28)
+            self.save_occ.setToolTip("Save occupancy map")
+            self.save_occ.clicked.connect(lambda: root.save_occupancy_map())
+            bottom.addWidget(self.save_occ)
+            bottom.addWidget(QtWidgets.QLabel("Loc:"))
             self.loc = _combo(
                 self, root.setting.localization_type, choices["localization"],
                 on_change=lambda: root.reload_stack(reload_code=False),
             )
-            grid.addWidget(self.loc, 5, 1)
+            bottom.addWidget(self.loc, 1)
+            from avlite.c10_perception.c13_localization_strategy import LocalizationStrategy
+
+            bottom.addWidget(_info_button(self, self.loc, LocalizationStrategy.registry))
+            outer.addLayout(bottom)
+            self._occupancy_mapper = OccupancyMapper.__name__
+            # A tall panel would otherwise spread these two rows apart.
+            outer.addStretch(1)
             # Full-width placement happens in StackPanels. Keeping it in this
             # column made the monospace line clip, and letting it grow moved the panel.
             self.state_lbl = QtWidgets.QLabel()
@@ -234,7 +274,9 @@ def _install_panels() -> None:
             pin_fluid_readout(self.state_lbl)
             root.setting.vehicle_state.bind(lambda: self.state_lbl.setText(str(root.setting.vehicle_state.get())))
             root.setting.perception_type.bind(self._update_pipeline_visibility)
+            root.setting.mapping_type.bind(self._update_save_map_visibility)
             self._update_pipeline_visibility()
+            self._update_save_map_visibility()
 
         def _update_pipeline_visibility(self) -> None:
             # Tk drops these rows unless the strategy is the pipeline. Leaving
@@ -245,6 +287,11 @@ def _install_panels() -> None:
             show = self.root.setting.perception_type.get() == PerceptionPipeline.__name__
             for widget in self._pipeline_rows:
                 widget.setVisible(show)
+
+        def _update_save_map_visibility(self) -> None:
+            if bool(self.root.setting.p67_perception_folded.get()):
+                return
+            self.save_occ.setVisible(self.root.setting.mapping_type.get() == self._occupancy_mapper)
 
         def refresh(self) -> None:
             choices = self.root.setting.registry_choices()
@@ -289,6 +336,9 @@ def _install_panels() -> None:
             btn_lreplan = QtWidgets.QPushButton("Local Replan")
             btn_lreplan.clicked.connect(lambda: self.root.local_replan())
             grid.addWidget(btn_lreplan, 1, 2)
+            from avlite.c20_planning.c23_local_planning_strategy import LocalPlanningStrategy
+
+            grid.addWidget(_info_button(self, self.lplan, LocalPlanningStrategy.registry), 1, 3)
             wp_row = QtWidgets.QHBoxLayout()
             for label, slot in (
                 ("WP+", lambda: root.step_plan()),
@@ -300,6 +350,8 @@ def _install_panels() -> None:
                 b.clicked.connect(slot)
                 wp_row.addWidget(b)
             grid.addLayout(wp_row, 7, 0, 1, 3)
+            # Extra panel height stays under the buttons instead of opening gaps.
+            grid.setRowStretch(8, 1)
             from avlite.c20_planning.c23_local_planning_strategy import (
                 LocalBehavioralPlanningStrategy,
                 LocalPathPlanningStrategy,
@@ -323,21 +375,42 @@ def _install_panels() -> None:
                 [""] + list(LocalVelocityPlanningStrategy.registry.keys()),
                 root.refresh_pipeline,
             )
-            self.lbl_behavior = _named_row(grid, 2, "Behavior", self.beh, "behavior")
-            self.lbl_path = _named_row(grid, 3, "Path", self.path, "path")
-            self.lbl_speed = _named_row(grid, 4, "Speed", self.vel, "speed")
+            # Tk packs Behavior, Path, and Speed on one line, and drops that line
+            # unless the local planner is the pipeline.
+            self._pipe = QtWidgets.QWidget()
+            pipe = QtWidgets.QHBoxLayout(self._pipe)
+            pipe.setContentsMargins(0, 0, 0, 0)
+            self.lbl_behavior = QtWidgets.QLabel("Behavior")
+            self.lbl_behavior.setObjectName("behaviorLabel")
+            self.beh.setObjectName("behaviorCombo")
+            self.lbl_path = QtWidgets.QLabel("Path")
+            self.lbl_path.setObjectName("pathLabel")
+            self.path.setObjectName("pathCombo")
+            self.lbl_speed = QtWidgets.QLabel("Speed")
+            self.lbl_speed.setObjectName("speedLabel")
+            self.vel.setObjectName("speedCombo")
+            beh_info = _info_button(self, self.beh, LocalBehavioralPlanningStrategy.registry)
+            path_info = _info_button(self, self.path, LocalPathPlanningStrategy.registry)
+            vel_info = _info_button(self, self.vel, LocalVelocityPlanningStrategy.registry)
+            for widget in (
+                self.lbl_behavior, self.beh, beh_info,
+                self.lbl_path, self.path, path_info,
+                self.lbl_speed, self.vel, vel_info,
+            ):
+                pipe.addWidget(widget, 1 if widget in (self.beh, self.path, self.vel) else 0)
+            grid.addWidget(self._pipe, 2, 0, 1, 4)
             self._pipeline_rows = (
-                self.lbl_behavior, self.beh, self.lbl_path, self.path, self.lbl_speed, self.vel,
+                self._pipe,
+                self.lbl_behavior, self.beh, beh_info,
+                self.lbl_path, self.path, path_info,
+                self.lbl_speed, self.vel, vel_info,
             )
             self.prob = _check(self, "Probabilistic collision", root.setting.probabilistic_collision_checking)
-            grid.addWidget(self.prob, 5, 0, 1, 2)
-            save_occ = QtWidgets.QPushButton("Save occupancy")
-            save_occ.clicked.connect(lambda: root.save_occupancy_map())
-            grid.addWidget(save_occ, 5, 2)
+            grid.addWidget(self.prob, 3, 0, 1, 2)
             self.wp_lbl = QtWidgets.QLabel("WP:      0   Lap:      0")
             self.wp_lbl.setObjectName("wpLap")
             pin_readout(self.wp_lbl, "WP: 999999   Lap: 999999")
-            grid.addWidget(self.wp_lbl, 6, 0, 1, 3)
+            grid.addWidget(self.wp_lbl, 4, 0, 1, 3)
             root.setting.current_wp.bind(self._update_wp)
             root.setting.lap.bind(self._update_wp)
             root.setting.local_planner_type.bind(self._update_pipeline_visibility)

@@ -8,6 +8,16 @@ import yaml
 from conftest import PLUGIN_DIR, ensure_plugin_loaded
 
 
+def test_raceline_colors_follow_the_tk_stops():
+    from avlite.plugins.avlite_QT5.plot_widgets import _velocity_colors
+
+    slow, mid, fast = _velocity_colors([0.0, 5.0, 10.0], "relative")
+    assert slow == (57, 255, 20, 255)
+    assert mid == (255, 215, 0, 255)
+    assert fast == (220, 20, 60, 255)
+    assert _velocity_colors([float("nan")], "relative") == [(80, 80, 80, 0)]
+
+
 def test_plugin_settings_section_uses_import_name():
     ensure_plugin_loaded()
     from avlite.c60_apps.c65_setting_utils import setting_section
@@ -145,15 +155,28 @@ def test_pipeline_sub_strategies_follow_the_selected_strategy(window, qapp, monk
     window._ui_timer.stop()
     window.show()
     qapp.processEvents()
+    sizes = window.plots_splitter.sizes()
+    total = sum(sizes) or 1
+    # default.yaml stores Frenet 0.6144, global 0.2061, control 0.1795.
+    assert sizes[0] / total == pytest.approx(0.6144, abs=0.08)
+    assert sizes[1] / total == pytest.approx(0.2061, abs=0.08)
+    assert window.local_plot.xy_plot.isHidden()
+    assert not window.local_plot.frenet_plot.isHidden()
     perc = window.stack_panels.perception
     plan = window.stack_panels.planning
 
     assert perc.perc.currentText() == "PerceptionPipeline"
     assert not perc.det.isHidden() and not perc.lbl_predict.isHidden()
+    # Detect sits beside the strategy combo, the way Tk packs that block.
+    # Combo geometry is relative to its own parent, so compare in the panel.
+    detect_x = perc.det.mapTo(perc, perc.det.rect().topLeft()).x()
+    assert detect_x >= perc.perc.geometry().right() - 8
     assert plan.lplan.currentText() != "LocalPlanningPipeline"
     assert plan.beh.isHidden() and plan.lbl_behavior.isHidden()
     assert plan.path.isHidden() and plan.vel.isHidden()
-    assert perc.mapping.geometry().top() > perc.prd.geometry().bottom()
+    map_y = perc.mapping.mapTo(perc, perc.mapping.rect().topLeft()).y()
+    predict_bottom = perc.prd.mapTo(perc, perc.prd.rect().bottomLeft()).y()
+    assert map_y > predict_bottom
     # Unfolding shows every row, then the pipeline rule hides its own again.
     window.setting.p67_plan_folded.set(True)
     qapp.processEvents()
@@ -186,7 +209,11 @@ def test_pipeline_sub_strategies_follow_the_selected_strategy(window, qapp, monk
     assert not plan.beh.isHidden() and not plan.lbl_behavior.isHidden()
     assert not plan.path.isHidden() and not plan.lbl_path.isHidden()
     assert not plan.vel.isHidden() and not plan.lbl_speed.isHidden()
-    assert plan.prob.geometry().top() > plan.vel.geometry().bottom()
+    assert abs(plan.beh.geometry().top() - plan.path.geometry().top()) < 8
+    assert plan.path.geometry().left() > plan.beh.geometry().right() - 4
+    prob_y = plan.prob.mapTo(plan, plan.prob.rect().topLeft()).y()
+    speed_bottom = plan.vel.mapTo(plan, plan.vel.rect().bottomLeft()).y()
+    assert prob_y > speed_bottom
     assert not perc.det.isHidden()
 
     plan.lplan.setCurrentText(original_local)
@@ -194,3 +221,12 @@ def test_pipeline_sub_strategies_follow_the_selected_strategy(window, qapp, monk
     assert errors == []
     assert plan.beh.isHidden() and plan.path.isHidden() and plan.vel.isHidden()
     assert plan.prob.geometry().top() - plan.lplan.geometry().bottom() < 36
+    # The occupancy save button belongs on Map, and only for OccupancyMapper.
+    previous_map = window.setting.mapping_type.get()
+    assert perc.save_occ.isHidden()
+    window.setting.mapping_type.set("OccupancyMapper")
+    qapp.processEvents()
+    assert not perc.save_occ.isHidden()
+    window.setting.mapping_type.set(previous_map)
+    qapp.processEvents()
+    assert perc.save_occ.isHidden()

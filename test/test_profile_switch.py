@@ -43,7 +43,13 @@ def test_profile_combo_reloads_stack_views_and_notes(window, monkeypatch):
     assert window.setting.p66_frenet_zoom == pytest.approx(80.0)
     assert window.setting.p67_global_plan_view.get() is False
     assert window.global_plot.isHidden()
+    # The file says ControlPlot is closed and p67_show_control_view is still true.
+    # Tk follows the pane list, so the control plot stays closed.
+    assert window.setting.p67_show_control_view.get() is False
+    assert window.control_plot.isHidden()
     assert window.setting.p67_show_local_global_view.get() is True
+    assert not window.local_plot.xy_plot.isHidden()
+    assert not window.local_plot.frenet_plot.isHidden()
     assert window.stack_panels.perception.prd.currentText() == "ConstantVelocityGMM"
     assert window.local_plot.xy_plot.backgroundBrush().color().name() == "#333333"
     assert "avlite-QT5" in dict(AppSettings.c62_community_plugins or {})
@@ -59,6 +65,10 @@ def test_profile_combo_reloads_stack_views_and_notes(window, monkeypatch):
     _select(window, "Mapping")
     assert errors == []
     assert len(notes) == 1
+    assert window.control_plot.isHidden()
+    assert window.global_plot.isHidden()
+    assert window.local_plot.frenet_plot.isHidden()
+    assert not window.local_plot.xy_plot.isHidden()
     assert "occupancy mapping" in str(notes[0][2]).lower() or "occupancy mapping" in str(notes[0][-1]).lower()
     window.load_settings(profile="Mapping")
     assert len(notes) == 1

@@ -27,6 +27,62 @@ from avlite.c60_apps.c62_factory import StackSettingsSync
 from avlite.c60_apps.c69_settings import AppSettings
 
 
+# Tk plot class name -> the boolean the Qt panes already read.
+# A profile can disagree with itself: Prediction stores ControlPlot false and
+# p67_show_control_view true. Tk shows the dict.
+_PLOT_OPEN = (
+    ("LocalGlobalPlot", "p67_show_local_global_view"),
+    ("FrenetPlot", "p67_show_local_frenet_view"),
+    ("GlobalPlanPlot", "p67_global_plan_view"),
+    ("ControlPlot", "p67_show_control_view"),
+)
+
+
+def apply_saved_plot_visibility(setting) -> None:
+    """Copy ``p67_plot_visible`` onto the pane booleans.
+
+    The booleans in a bundled profile are leftovers. The dict is the list of
+    panes Tk actually opens, so a switch has to follow the dict.
+    """
+    saved = getattr(setting, "p67_plot_visible", None)
+    if not isinstance(saved, dict) or not saved:
+        return
+    for name, field in _PLOT_OPEN:
+        if name not in saved:
+            continue
+        var = getattr(setting, field, None)
+        if var is not None and bool(var.get()) != bool(saved[name]):
+            var.set(bool(saved[name]))
+
+
+def note_plot_visibility(setting, name: str, visible: bool) -> None:
+    """Remember a checkbox change under the Tk plot name, so a later save matches."""
+    saved = dict(getattr(setting, "p67_plot_visible", None) or {})
+    saved[str(name)] = bool(visible)
+    setting.p67_plot_visible = saved
+
+
+def plot_fractions(setting) -> dict[str, float]:
+    """Width share of each open pane. Saved sash fractions win when they name those panes."""
+    flags = {
+        name: bool(getattr(setting, field).get())
+        for name, field in _PLOT_OPEN
+        if getattr(setting, field, None) is not None
+    }
+    names = [name for name, open_ in flags.items() if open_]
+    saved = dict(getattr(setting, "p67_plot_sashes", None) or {})
+    if (
+        2 <= len(names) <= 4
+        and set(saved) == set(names)
+        and all(float(saved[name]) > 0 for name in names)
+    ):
+        return {name: float(saved[name]) for name in names}
+    if not names:
+        return {}
+    share = 1.0 / len(names)
+    return {name: share for name in names}
+
+
 def apply_visualizer_profile(schema, profile: str) -> None:
     """Load the visualizer block the way a Tk-authored profile stores it.
 
@@ -143,6 +199,7 @@ class VisualizationSettings:
         self.p67_global_plan_view = Var(bool(PluginSettings.p67_global_plan_view))
         self.p67_show_control_view = Var(bool(PluginSettings.p67_show_control_view))
         self.p67_local_plan_view = Var(bool(PluginSettings.p67_local_plan_view))
+        self.p67_plot_visible = dict(PluginSettings.p67_plot_visible or {})
         self.p67_plot_sashes = dict(PluginSettings.p67_plot_sashes or {})
         self.p67_perception_folded = Var(bool(PluginSettings.p67_perception_folded))
         self.p67_plan_folded = Var(bool(PluginSettings.p67_plan_folded))
@@ -334,6 +391,7 @@ class VisualizationSettings:
                 setattr(self, name, dict(value))
             elif current is not None and not callable(current):
                 setattr(self, name, value)
+        apply_saved_plot_visibility(self)
 
     def push_plugin_schema(self) -> None:
         """Copy live visualizer values back onto the schema.

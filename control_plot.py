@@ -530,7 +530,9 @@ def _install() -> None:
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
             colors = _colors(self)
-            painter.fillRect(self.rect(), colors["face"])
+            # Tk's g-g canvas uses the panel background, so the rings are not a darker card.
+            panel = self.palette().color(QtGui.QPalette.Window)
+            painter.fillRect(self.rect(), panel)
             if self.width() < 8 or self.height() < 8:
                 self.label_rects = []
                 return
@@ -584,7 +586,7 @@ def _install() -> None:
             drawn = []
             for text, rect, faint in items:
                 painter.setPen(QtCore.Qt.NoPen)
-                painter.setBrush(colors["face"])
+                painter.setBrush(panel)
                 painter.drawRect(rect.adjusted(-1.0, 0.0, 1.0, 0.0))
                 painter.setPen(colors["faint"] if faint else colors["ink"])
                 drawn.append(_draw_centered(painter, font, text, rect.center().x(), rect.center().y()))

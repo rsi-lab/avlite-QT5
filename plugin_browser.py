@@ -202,6 +202,8 @@ class _Page:
             layout.addLayout(auth)
         disclaimer = QtWidgets.QLabel(_MEMBERS_DISCLAIMER if private else _COMMUNITY_DISCLAIMER)
         disclaimer.setWordWrap(True)
+        # Tk paints this warning brown in both themes so it is not body text.
+        disclaimer.setStyleSheet("color: #996633;")
         layout.addWidget(disclaimer)
         filters = QtWidgets.QHBoxLayout()
         self.only_installed = QtWidgets.QCheckBox("Show Installed only")
