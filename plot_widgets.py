@@ -20,6 +20,19 @@ log = logging.getLogger(__name__)
 
 
 
+def _curve_bodies(ego_curve, agent_curves) -> list:
+    """Closed footprints for the ego, then each agent, in Tk's patch colors."""
+    bodies = []
+    xs, ys = ego_curve.getData()
+    if xs is not None and len(xs) >= 3:
+        bodies.append((np.column_stack((xs, ys)), _EGO_FILL))
+    for curve in agent_curves:
+        xs, ys = curve.getData()
+        if xs is not None and len(xs) >= 3:
+            bodies.append((np.column_stack((xs, ys)), _AGENT_FILL))
+    return bodies
+
+
 def _closed_poly(corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if corners is None or len(corners) == 0:
         return np.array([]), np.array([])
@@ -174,6 +187,31 @@ def _ellipse_polygon(center: np.ndarray, cov: np.ndarray, percentile: float, n: 
     return np.vstack((polygon, polygon[:1]))
 
 
+# Tk draws these as solid polylines (darkorange ahead of the ego, mediumpurple behind)
+# and, for GP and GMM, unfilled 50% and 95% rings about every half-second.
+_AHEAD_RGB = (255, 140, 0)
+_BEHIND_RGB = (147, 112, 219)
+_ELLIPSE_PERCENTILES = (0.5, 0.95)
+_ELLIPSE_STRIDE_S = 0.5
+_ELLIPSE_SAMPLES = 24
+# Tk's vehicle patches: azure fill, red ego edge, darkblue agent edge.
+# The alpha is the patch alpha, so the fill stays light on a #333333 plot.
+_EGO_FILL = (240, 255, 255, 178)
+_AGENT_FILL = (240, 255, 255, 153)
+_EGO_EDGE = (255, 0, 0, 178)
+_AGENT_EDGE = (0, 0, 139, 153)
+
+
+def _ellipse_steps(n_steps: int, dt: float, stride_s: float = _ELLIPSE_STRIDE_S) -> list[int]:
+    if n_steps <= 0:
+        return []
+    stride = max(1, int(round(stride_s / dt))) if dt > 0.0 else n_steps
+    indices = list(range(stride - 1, n_steps, stride))
+    if not indices or indices[-1] != n_steps - 1:
+        indices.append(n_steps - 1)
+    return indices
+
+
 def _step_covariance(pred, agent_id, mode_index: int, step: int) -> np.ndarray | None:
     joint = getattr(pred, "covariance", None)
     if isinstance(joint, dict) and agent_id in joint:
@@ -187,6 +225,61 @@ def _step_covariance(pred, agent_id, mode_index: int, step: int) -> np.ndarray |
         if mat.ndim == 4 and mode_index < mat.shape[0] and step < mat.shape[1]:
             return mat[mode_index, step]
     return None
+
+
+def _prediction_drawings(pred, agents, ego) -> tuple[list, list]:
+    """World-frame forecast lines and ellipse rings, matching the Tk painter.
+
+    Each entry is ``(Nx2, (r, g, b, a))`` with ``a`` in 0..1. Line opacity is
+    the mode weight. A ring's opacity is that weight times its percentile.
+    """
+    from avlite.c10_perception.c11_perception_model import GMM, GP, MultiTrajectory, SingleTrajectory
+
+    if not isinstance(pred, (SingleTrajectory, MultiTrajectory, GP, GMM)) or ego is None:
+        return [], []
+    heading = np.array([np.cos(float(ego.theta)), np.sin(float(ego.theta))])
+    ego_xy = np.array([float(ego.x), float(ego.y)])
+    draw_rings = isinstance(pred, (GP, GMM))
+    dt = float(getattr(pred, "predict_delta_t", 0.1) or 0.1)
+    grouped: dict = {}
+    for aid, mode, path, weight in _forecast_modes(pred):
+        grouped.setdefault(aid, []).append((mode, path, weight))
+    lines: list = []
+    rings: list = []
+    for agent in agents:
+        modes = grouped.get(getattr(agent, "agent_id", None))
+        if not modes:
+            continue
+        to_agent = np.array([float(agent.x) - ego_xy[0], float(agent.y) - ego_xy[1]])
+        rgb = _BEHIND_RGB if float(np.dot(heading, to_agent)) < 0.0 else _AHEAD_RGB
+        pose = np.array([[float(agent.x), float(agent.y)]], dtype=float)
+        for mode_index, path, weight in modes:
+            alpha = float(np.clip(weight, 0.0, 1.0))
+            if alpha <= 0.0 or len(path) == 0:
+                continue
+            full = np.vstack((pose, np.asarray(path, dtype=float)[:, :2]))
+            lines.append((full, (*rgb, alpha)))
+            if not draw_rings:
+                continue
+            for step in _ellipse_steps(len(path), dt):
+                cov = _step_covariance(pred, agent.agent_id, mode_index, step)
+                if cov is None:
+                    continue
+                center = np.asarray(path[step], dtype=float)
+                for percentile in _ELLIPSE_PERCENTILES:
+                    poly = _ellipse_polygon(center, cov, percentile, _ELLIPSE_SAMPLES)
+                    if poly is not None:
+                        rings.append((poly, (*rgb, alpha * percentile)))
+    return lines, rings
+
+
+def _map_drawings(drawings, gt) -> list:
+    mapped = []
+    for pts, color in drawings:
+        sd = _to_sd(gt, pts)
+        if len(sd) >= 2:
+            mapped.append((sd, color))
+    return mapped
 
 
 def _occupancy_grid(pm):
@@ -316,9 +409,13 @@ def _local_plan_paths(lp) -> list[np.ndarray]:
 
 
 def _velocity_colors(speed: np.ndarray, scale: str) -> list[tuple[int, int, int, int]]:
+    """Tk's raceline: slow is #39ff14, mid is #ffd700, fast is #dc143c."""
     v = np.asarray(speed, dtype=float)
     if scale == "absolute":
-        t = np.clip(v / 30.0, 0.0, 1.0)
+        from avlite.c30_control.c39_settings import ControlSettings
+
+        vmax = float(ControlSettings.c32_ego_max_velocity)
+        t = np.clip(v / vmax, 0.0, 1.0) if vmax > 0.0 else np.zeros_like(v)
     else:
         finite = v[np.isfinite(v)]
         if len(finite) == 0 or float(np.max(finite) - np.min(finite)) < 1e-6:
@@ -326,11 +423,17 @@ def _velocity_colors(speed: np.ndarray, scale: str) -> list[tuple[int, int, int,
         else:
             lo, hi = float(np.min(finite)), float(np.max(finite))
             t = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
+    t = np.where(np.isfinite(v), t, np.nan)
     u = np.asarray(t, dtype=float)
-    r = (40 + 215 * u).astype(np.int32)
-    g = (80 + 140 * (1.0 - np.abs(u - 0.5) * 2.0)).astype(np.int32)
-    b = (220 * (1.0 - u)).astype(np.int32)
-    colors = np.column_stack([r, g, b, np.full(u.shape, 230, dtype=np.int32)])
+    slow = np.array([57, 255, 20], dtype=float)
+    mid = np.array([255, 215, 0], dtype=float)
+    fast = np.array([220, 20, 60], dtype=float)
+    left = np.where(u[:, None] < 0.5, slow, mid)
+    right = np.where(u[:, None] < 0.5, mid, fast)
+    mix = np.where(u < 0.5, u / 0.5, (u - 0.5) / 0.5)
+    rgb = left * (1.0 - mix[:, None]) + right * mix[:, None]
+    rgb = np.where(np.isfinite(rgb), rgb, 0.0)
+    colors = np.column_stack([np.rint(rgb).astype(np.int32), np.full(u.shape, 255, dtype=np.int32)])
     colors[~np.isfinite(u)] = (80, 80, 80, 0)
     return [tuple(int(c) for c in row) for row in colors]
 
@@ -590,6 +693,174 @@ def _install_widgets() -> None:
 
     _WIDGETS_READY = True
 
+    class _ForecastLayer(pg.GraphicsObject):
+        """One paint for every forecast line and ellipse ring."""
+
+        def __init__(self):
+            super().__init__()
+            self.lines: list = []
+            self.rings: list = []
+            self._polys: list = []
+            self._bounds = QtCore.QRectF()
+
+        def clear(self) -> None:
+            self.set_drawings([], [])
+
+        def set_drawings(self, lines, rings) -> None:
+            self.prepareGeometryChange()
+            self.lines = lines
+            self.rings = rings
+            polys = []
+            xs: list[np.ndarray] = []
+            ys: list[np.ndarray] = []
+            for width, batch in ((1.0, rings), (1.5, lines)):
+                for pts, color in batch:
+                    arr = np.asarray(pts, dtype=float)
+                    if arr.ndim != 2 or len(arr) < 2:
+                        continue
+                    poly = QtGui.QPolygonF(
+                        [QtCore.QPointF(float(x), float(y)) for x, y in arr[:, :2]]
+                    )
+                    polys.append((poly, color, width))
+                    xs.append(arr[:, 0])
+                    ys.append(arr[:, 1])
+            self._polys = polys
+            if xs:
+                x = np.concatenate(xs)
+                y = np.concatenate(ys)
+                self._bounds = QtCore.QRectF(
+                    float(x.min()), float(y.min()),
+                    float(x.max() - x.min()) or 1.0,
+                    float(y.max() - y.min()) or 1.0,
+                )
+            else:
+                self._bounds = QtCore.QRectF()
+            self.update()
+
+        def paint(self, painter, *args) -> None:
+            # Smoothing spreads a translucent stroke across neighboring pixels,
+            # so a light mode and a 50% ring come out grayer than the same rgba
+            # in Tk. A hard stroke keeps the alpha Tk blended onto #333333.
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            for poly, color, width in self._polys:
+                red, green, blue, alpha = color
+                pen = QtGui.QPen(QtGui.QColor(int(red), int(green), int(blue), int(round(float(alpha) * 255))))
+                pen.setCosmetic(True)
+                pen.setWidthF(width)
+                painter.setPen(pen)
+                painter.drawPolyline(poly)
+
+        def boundingRect(self):
+            return self._bounds
+
+    class _BodyLayer(pg.GraphicsObject):
+        """Filled vehicle footprints. The outline curves stay separate."""
+
+        def __init__(self):
+            super().__init__()
+            self.bodies: list = []
+            self._polys: list = []
+            self._bounds = QtCore.QRectF()
+
+        def clear(self) -> None:
+            self.set_bodies([])
+
+        def set_bodies(self, bodies) -> None:
+            self.prepareGeometryChange()
+            self.bodies = list(bodies)
+            polys = []
+            xs: list[np.ndarray] = []
+            ys: list[np.ndarray] = []
+            for pts, color in self.bodies:
+                arr = np.asarray(pts, dtype=float)
+                if arr.ndim != 2 or len(arr) < 3:
+                    continue
+                poly = QtGui.QPolygonF(
+                    [QtCore.QPointF(float(x), float(y)) for x, y in arr[:, :2]]
+                )
+                polys.append((poly, color))
+                xs.append(arr[:, 0])
+                ys.append(arr[:, 1])
+            self._polys = polys
+            if xs:
+                x = np.concatenate(xs)
+                y = np.concatenate(ys)
+                self._bounds = QtCore.QRectF(
+                    float(x.min()), float(y.min()),
+                    float(x.max() - x.min()) or 1.0,
+                    float(y.max() - y.min()) or 1.0,
+                )
+            else:
+                self._bounds = QtCore.QRectF()
+            self.update()
+
+        def paint(self, painter, *args) -> None:
+            painter.setPen(QtCore.Qt.NoPen)
+            for poly, color in self._polys:
+                red, green, blue, alpha = color
+                painter.setBrush(QtGui.QColor(int(red), int(green), int(blue), int(alpha)))
+                painter.drawPolygon(poly)
+
+        def boundingRect(self):
+            return self._bounds
+
+    class _VelocityLine(pg.GraphicsObject):
+        """One green-yellow-red raceline. Tk draws this as a width-5 collection."""
+
+        def __init__(self):
+            super().__init__()
+            self._segs: list = []
+            self._bounds = QtCore.QRectF()
+
+        def clear(self) -> None:
+            self.set_segments([], [], [])
+
+        def set_segments(self, xs, ys, colors) -> None:
+            self.prepareGeometryChange()
+            xa = np.asarray(xs, dtype=float).ravel()
+            ya = np.asarray(ys, dtype=float).ravel()
+            n = min(int(xa.size), int(ya.size), len(colors))
+            segs = []
+            for i in range(max(0, n - 1)):
+                if not (np.isfinite(xa[i]) and np.isfinite(ya[i]) and np.isfinite(xa[i + 1]) and np.isfinite(ya[i + 1])):
+                    continue
+                segs.append((float(xa[i]), float(ya[i]), float(xa[i + 1]), float(ya[i + 1]), colors[i]))
+            self._segs = segs
+            if segs:
+                xs_all = [seg[0] for seg in segs] + [segs[-1][2]]
+                ys_all = [seg[1] for seg in segs] + [segs[-1][3]]
+                self._bounds = QtCore.QRectF(
+                    min(xs_all), min(ys_all),
+                    max(xs_all) - min(xs_all) or 1.0,
+                    max(ys_all) - min(ys_all) or 1.0,
+                )
+            else:
+                self._bounds = QtCore.QRectF()
+            self.update()
+
+        def paint(self, painter, *args) -> None:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+            for x0, y0, x1, y1, color in self._segs:
+                red, green, blue, alpha = color
+                pen = QtGui.QPen(QtGui.QColor(int(red), int(green), int(blue), int(alpha)))
+                pen.setCosmetic(True)
+                pen.setWidthF(5.0)
+                pen.setCapStyle(QtCore.Qt.FlatCap)
+                painter.setPen(pen)
+                painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
+
+        def boundingRect(self):
+            return self._bounds
+
+    def _theme_plot(plot, bg: str, fg: str) -> None:
+        """Match Tk: plot face, axis line, tick text, and axis title use the theme."""
+        plot.setBackground(bg)
+        for side in ("bottom", "left"):
+            axis = plot.getAxis(side)
+            axis.setPen(fg)
+            axis.setTextPen(fg)
+
     class GlobalPlotWidget(pg.PlotWidget):
         """Global map / raceline / HD-map overview with ego marker."""
 
@@ -598,7 +869,7 @@ def _install_widgets() -> None:
             self.root = root
             self.setLabel("bottom", "x (m)")
             self.setLabel("left", "y (m)")
-            self.showGrid(x=True, y=True, alpha=0.25)
+            # Tk leaves the global axes clear. A grid cuts the velocity-colored raceline.
             self._center_delta = np.array([0.0, 0.0])
             self._map_bounds: Optional[tuple[float, float, float, float]] = None
             self._drag_pan = False
@@ -610,9 +881,14 @@ def _install_widgets() -> None:
             self._hover_plan_xy: Optional[np.ndarray] = None
             self._hover_plan_v: Optional[np.ndarray] = None
 
-            self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2), connect="finite")
-            self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
-            self.global_plan = self.plotItem.plot(pen=pg.mkPen("#4fc3f7", width=3), connect="finite")
+            self.left_boundary = self.plotItem.plot(pen=pg.mkPen("#ffa500", width=3), connect="finite")
+            self.right_boundary = self.plotItem.plot(pen=pg.mkPen("#d2b48c", width=3), connect="finite")
+            # The geometry stays on this curve for callers that read it. The
+            # visible raceline is the green-yellow-red stroke, matching Tk's width 5.
+            self.global_plan = self.plotItem.plot(pen=pg.mkPen(0, 0, 0, 0), connect="finite")
+            self.velocity_line = _VelocityLine()
+            self.velocity_line.setZValue(4)
+            self.addItem(self.velocity_line)
             self.global_plan_speed = pg.ScatterPlotItem(size=7, pen=None, pxMode=True)
             self.addItem(self.global_plan_speed)
             self.hdmap_lanes: list[pg.PlotDataItem] = []
@@ -680,6 +956,7 @@ def _install_widgets() -> None:
             self.hdmap_lanes.clear()
             self._lane_cache.clear()
             self.global_plan_speed.setData([], [])
+            self.velocity_line.clear()
             self.hd_closest.setData([], [])
             self.hd_text.hide()
             self.planner_text.hide()
@@ -694,9 +971,7 @@ def _install_widgets() -> None:
                 curve.setData([], [])
 
         def update_theme(self, bg: str, fg: str) -> None:
-            self.setBackground(bg)
-            self.getAxis("bottom").setPen(fg)
-            self.getAxis("left").setPen(fg)
+            _theme_plot(self, bg, fg)
 
         def _ctrl(self, modifiers) -> bool:
             return bool(modifiers & QtCore.Qt.ControlModifier)
@@ -864,24 +1139,60 @@ def _install_widgets() -> None:
             if status is not None:
                 status.set(text)
 
-        def _paint_plan_speed(self, xs, ys, vel) -> None:
+        def _paint_plan_speed(self, xs, ys, vel, window) -> None:
             xs = np.asarray(xs, dtype=float).ravel()
             ys = np.asarray(ys, dtype=float).ravel()
             vel_a = np.asarray([] if vel is None else vel, dtype=float).ravel()
             n = min(int(xs.size), int(ys.size), int(vel_a.size)) if vel_a.size else 0
             if n == 0:
                 _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
+                self.velocity_line.clear()
                 return
-            step = max(1, n // 400)
             scale = str(getattr(self.root.setting.schema, "p66_global_plan_velocity_scale", "relative"))
-            sample = vel_a[:n:max(1, n // 8)]
-            token = (n, step, scale, round(float(np.nansum(sample)), 2))
+            xs, ys, vel_a = xs[:n], ys[:n], vel_a[:n]
+            if window is not None:
+                # A single slice from the first hit to the last joins both ends of
+                # the lap and drags in vertices that are far outside the view.
+                x0, x1, y0, y1 = window
+                mx = (x1 - x0) * 0.15
+                my = (y1 - y0) * 0.15
+                keep = (xs >= x0 - mx) & (xs <= x1 + mx) & (ys >= y0 - my) & (ys <= y1 + my)
+                idx = np.flatnonzero(keep)
+                if idx.size == 0:
+                    _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
+                    self.velocity_line.clear()
+                    return
+                runs = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+                # Stride inside a run. Striding the joined array can skip the NaN
+                # and draw a chord between two pieces of the lap.
+                step = max(1, n // 1500)
+                parts_x, parts_y, parts_v = [], [], []
+                for k, run in enumerate(runs):
+                    a = max(int(run[0]) - 1, 0)
+                    b = min(int(run[-1]) + 2, n)
+                    if k:
+                        parts_x.append(np.array([np.nan]))
+                        parts_y.append(np.array([np.nan]))
+                        parts_v.append(np.array([np.nan]))
+                    parts_x.append(xs[a:b:step])
+                    parts_y.append(ys[a:b:step])
+                    parts_v.append(vel_a[a:b:step])
+                xs = np.concatenate(parts_x)
+                ys = np.concatenate(parts_y)
+                vel_a = np.concatenate(parts_v)
+                n = len(xs)
+                step = 1
+            else:
+                step = max(1, n // 1500)
+            token = (n, step, scale, _window_token(window), round(float(np.nansum(vel_a[::max(1, n // 8)])), 2))
             if self._curve_cache.get("speed") == token:
                 return
             self._curve_cache["speed"] = token
-            colors = _velocity_colors(vel_a[:n:step], scale)
-            brushes = [pg.mkBrush(*c) for c in colors]
-            self.global_plan_speed.setData(xs[:n:step], ys[:n:step], brush=brushes)
+            colors = _velocity_colors(vel_a[::step], scale)
+            self.velocity_line.set_segments(xs[::step], ys[::step], colors)
+            # Tk has no speed dots on top of the stroke. Keep the item empty so
+            # older callers can still ask it for data.
+            self.global_plan_speed.setData([], [])
 
         def _geom_for(self, plan):
             traj = getattr(plan, "trajectory", None) if plan is not None else None
@@ -1071,10 +1382,11 @@ def _install_widgets() -> None:
 
             if setting.p66_show_global_plan.get() and geom is not None and geom["traj"] is not None:
                 _push_windowed(self._curve_cache, self.global_plan, "gp", geom["refx"], geom["refy"], window)
-                self._paint_plan_speed(geom["refx"], geom["refy"], geom["vel"])
+                self._paint_plan_speed(geom["refx"], geom["refy"], geom["vel"], window)
             else:
                 _push_hidden(self._curve_cache, self.global_plan, "gp")
                 _push_hidden(self._curve_cache, self.global_plan_speed, "speed")
+                self.velocity_line.clear()
                 self._hover_plan_xy = None
                 self._hover_plan_v = None
 
@@ -1138,17 +1450,29 @@ def _install_widgets() -> None:
             ):
                 pw.setLabel("bottom", xlabel)
                 pw.setLabel("left", ylabel)
-                pw.showGrid(x=True, y=True, alpha=0.25)
+                pw.setMinimumWidth(0)
+                # Tk leaves these axes clear. A grid cuts through the
+                # translucent forecast rings on the dark plot.
                 _pin_plot_chrome(pw)
-            layout.addWidget(self.xy_plot, 1)
-            layout.addWidget(self.frenet_plot, 1)
+            # Tk puts LocalGlobalPlot and FrenetPlot next to each other.
+            # Stacking them made each one short once both were open.
+            self.panes = QtWidgets.QSplitter()
+            self.panes.setOrientation(QtCore.Qt.Horizontal)
+            self.panes.setChildrenCollapsible(True)
+            self.panes.addWidget(self.xy_plot)
+            self.panes.addWidget(self.frenet_plot)
+            layout.addWidget(self.panes, 1)
             self.legend = QtWidgets.QLabel(
-                "orange/tan boundary · cyan plan · red ego · green past · "
-                "lime lidar · yellow clusters · orange ahead / purple behind prediction · "
+                "orange/tan boundary · cyan track · gray plan · red local plan · "
+                "azure vehicles · green past · lime lidar · yellow clusters · "
+                "orange ahead / purple behind prediction · "
                 "green feasible / blue kinematic / red collision lattice"
             )
             self.legend.setObjectName("plotLegend")
             self.legend.setWordWrap(True)
+            self.legend.setStyleSheet(
+                f"color: {root.setting.p60_fg_color}; background: {root.setting.p60_bg_color};"
+            )
             layout.addWidget(self.legend)
 
             self._init_curves()
@@ -1176,27 +1500,29 @@ def _install_widgets() -> None:
             attach_plot_mouse(self.frenet_plot, _PaneMouse(self, frenet=True))
 
         def _init_curves(self) -> None:
-            self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=2), connect="finite")
+            self.xy_left = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ffa500", width=2), connect="finite")
             self.xy_right = self.xy_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
-            self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#888888", width=2), connect="finite")
-            self.xy_local = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
-            self.xy_ego = self.xy_plot.plotItem.plot(pen=pg.mkPen("r", width=2))
+            self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#808080", width=2), connect="finite")
+            # Tk's local plan is a wide translucent red stroke, not a thin line.
+            self.xy_local = self.xy_plot.plotItem.plot(
+                pen=pg.mkPen(QtGui.QColor(255, 0, 0, 153), width=8), connect="finite",
+            )
+            ego_pen = pg.mkPen(QtGui.QColor(*_EGO_EDGE), width=1.5)
+            agent_pen = pg.mkPen(QtGui.QColor(*_AGENT_EDGE), width=1.0)
+            self.xy_bodies = _BodyLayer()
+            self.xy_bodies.setZValue(-1)
+            self.xy_plot.addItem(self.xy_bodies)
+            self.xy_ego = self.xy_plot.plotItem.plot(pen=ego_pen)
             self.xy_agents = [
-                self.xy_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
+                self.xy_plot.plotItem.plot(pen=agent_pen) for _ in range(12)
             ]
             self.xy_lidar = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(50, 255, 50, 200), pen=None)
             self.xy_plot.addItem(self.xy_lidar)
             self.xy_clusters = pg.ScatterPlotItem(size=6, brush=pg.mkBrush(255, 255, 0, 220), pen=None)
             self.xy_plot.addItem(self.xy_clusters)
-            self.xy_pred = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.xy_pred_behind = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#7e57c2", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.xy_ellipses = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1), connect="finite",
-            )
+            self.xy_pred = _ForecastLayer()
+            self.xy_pred.setZValue(8)
+            self.xy_plot.addItem(self.xy_pred)
             self.xy_past = self.xy_plot.plotItem.plot(pen=pg.mkPen("#66bb6a", width=1.5))
             self.xy_lattice = self.xy_plot.plotItem.plot(
                 pen=pg.mkPen("#8ec07c", width=1), connect="finite",
@@ -1208,9 +1534,9 @@ def _install_widgets() -> None:
                 pen=pg.mkPen("#4169e1", width=1), connect="finite",
             )
             self.xy_track = self.xy_plot.plotItem.plot(
-                pen=pg.mkPen("#bdbdbd", width=1), connect="finite",
+                pen=pg.mkPen(QtGui.QColor(0, 255, 255, 128), width=1), connect="finite",
             )
-            self.xy_heading = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=2))
+            self.xy_heading = self.xy_plot.plotItem.plot(pen=pg.mkPen("#2f4f4f", width=1.5))
             self.xy_wp = self.xy_plot.plotItem.plot(
                 pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=12,
             )
@@ -1232,23 +1558,24 @@ def _install_widgets() -> None:
             self.xy_occ.hide()
             self.xy_flow.hide()
 
-            self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ff8c00", width=1), connect="finite")
+            self.sd_left = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ffa500", width=1), connect="finite")
             self.sd_right = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=1), connect="finite")
-            self.sd_ref = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#888888", width=1), connect="finite")
-            self.sd_local = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
-            self.sd_ego = self.frenet_plot.plotItem.plot(pen=pg.mkPen("r", width=2))
+            self.sd_ref = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen(QtGui.QColor(128, 128, 128, 128), width=1), connect="finite",
+            )
+            self.sd_local = self.frenet_plot.plotItem.plot(
+                pen=pg.mkPen(QtGui.QColor(255, 0, 0, 153), width=8), connect="finite",
+            )
+            self.sd_bodies = _BodyLayer()
+            self.sd_bodies.setZValue(-1)
+            self.frenet_plot.addItem(self.sd_bodies)
+            self.sd_ego = self.frenet_plot.plotItem.plot(pen=ego_pen)
             self.sd_agents = [
-                self.frenet_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
+                self.frenet_plot.plotItem.plot(pen=agent_pen) for _ in range(12)
             ]
-            self.sd_pred = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.sd_pred_behind = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#7e57c2", width=1.5, style=QtCore.Qt.DashLine), connect="finite",
-            )
-            self.sd_ellipses = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#ff9800", width=1), connect="finite",
-            )
+            self.sd_pred = _ForecastLayer()
+            self.sd_pred.setZValue(8)
+            self.frenet_plot.addItem(self.sd_pred)
             self.sd_lattice = self.frenet_plot.plotItem.plot(
                 pen=pg.mkPen("#8ec07c", width=1), connect="finite",
             )
@@ -1259,7 +1586,7 @@ def _install_widgets() -> None:
                 pen=pg.mkPen("#4169e1", width=1), connect="finite",
             )
             self.sd_track = self.frenet_plot.plotItem.plot(
-                pen=pg.mkPen("#bdbdbd", width=1), connect="finite",
+                pen=pg.mkPen(QtGui.QColor(0, 255, 255, 128), width=1), connect="finite",
             )
             self.sd_wp = self.frenet_plot.plotItem.plot(
                 pen=None, symbol="x", symbolPen=pg.mkPen("#ffffff", width=2), symbolSize=12,
@@ -1290,18 +1617,21 @@ def _install_widgets() -> None:
         def reset(self) -> None:
             for curve in (
                 self.xy_left, self.xy_right, self.xy_ref, self.xy_local, self.xy_ego,
-                self.xy_pred, self.xy_pred_behind, self.xy_ellipses, self.xy_past,
+                self.xy_past,
                 self.xy_lattice, self.xy_lattice_hit, self.xy_lattice_kin,
                 self.xy_track, self.xy_heading, self.xy_wp, self.xy_wp_next,
                 self.xy_lwp, self.xy_lwp_next,
                 self.sd_left, self.sd_right, self.sd_ref, self.sd_local, self.sd_ego,
-                self.sd_pred, self.sd_pred_behind, self.sd_ellipses,
                 self.sd_lattice, self.sd_lattice_hit, self.sd_lattice_kin,
                 self.sd_track, self.sd_wp, self.sd_wp_next, self.sd_lwp, self.sd_lwp_next,
             ):
                 curve.setData([], [])
             for c in self.xy_agents + self.sd_agents:
                 c.setData([], [])
+            self.xy_bodies.clear()
+            self.sd_bodies.clear()
+            self.xy_pred.clear()
+            self.sd_pred.clear()
             self.xy_lidar.setData([], [])
             self.xy_clusters.setData([], [])
             self.sd_lidar.setData([], [])
@@ -1321,9 +1651,8 @@ def _install_widgets() -> None:
 
         def update_theme(self, bg: str, fg: str) -> None:
             for pw in (self.xy_plot, self.frenet_plot):
-                pw.setBackground(bg)
-                pw.getAxis("bottom").setPen(fg)
-                pw.getAxis("left").setPen(fg)
+                _theme_plot(pw, bg, fg)
+            self.legend.setStyleSheet(f"color: {fg}; background: {bg};")
 
         def update_visibility(self) -> None:
             s = self.root.setting
@@ -1809,13 +2138,16 @@ def _install_widgets() -> None:
                 self.xy_heading.setData([], [])
                 for curve in self.xy_agents + self.sd_agents:
                     curve.setData([], [])
+                self.xy_bodies.clear()
+                self.sd_bodies.clear()
                 return
             self._curve_cache["ego_off"] = False
             pose = (
                 round(float(ego.x), 3), round(float(ego.y), 3), round(float(ego.theta), 4),
                 self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
             )
-            if self._curve_cache.get("ego_pose") != pose:
+            pose_changed = self._curve_cache.get("ego_pose") != pose
+            if pose_changed:
                 self._curve_cache["ego_pose"] = pose
                 if self._xy_on:
                     self.xy_ego.setData(*_closed_poly(ego.get_bb_corners()))
@@ -1850,23 +2182,29 @@ def _install_widgets() -> None:
                     for a in agents
                 ),
             )
-            if self._curve_cache.get("agents") == atoken:
-                return
-            self._curve_cache["agents"] = atoken
-            for i, curve in enumerate(self.xy_agents):
-                if self._xy_on and i < len(agents):
-                    curve.setData(*_closed_poly(agents[i].get_bb_corners()))
-                else:
-                    curve.setData([], [])
-            for i, curve in enumerate(self.sd_agents):
-                if self._frenet_on and gt is not None and i < len(agents):
-                    try:
-                        sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
-                        curve.setData(*_closed_poly(sd_c))
-                    except Exception:
+            agents_changed = self._curve_cache.get("agents") != atoken
+            if agents_changed:
+                self._curve_cache["agents"] = atoken
+                for i, curve in enumerate(self.xy_agents):
+                    if self._xy_on and i < len(agents):
+                        curve.setData(*_closed_poly(agents[i].get_bb_corners()))
+                    else:
                         curve.setData([], [])
-                else:
-                    curve.setData([], [])
+                for i, curve in enumerate(self.sd_agents):
+                    if self._frenet_on and gt is not None and i < len(agents):
+                        try:
+                            sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
+                            curve.setData(*_closed_poly(sd_c))
+                        except Exception:
+                            curve.setData([], [])
+                    else:
+                        curve.setData([], [])
+            if pose_changed or agents_changed:
+                self._sync_vehicle_bodies()
+
+        def _sync_vehicle_bodies(self) -> None:
+            self.xy_bodies.set_bodies(_curve_bodies(self.xy_ego, self.xy_agents))
+            self.sd_bodies.set_bodies(_curve_bodies(self.sd_ego, self.sd_agents))
 
         def _lidar_allowed(self, stack) -> bool:
             try:
@@ -1882,10 +2220,19 @@ def _install_widgets() -> None:
         def _fetch_lidar(self, stack):
             try:
                 frame = stack.world.get_sensor_frame()
-                lidar = getattr(frame, "lidar", None)
+                lidar = frame.get_lidar() if hasattr(frame, "get_lidar") else None
+                if lidar is None:
+                    lidar = getattr(frame, "lidar", None)
                 pts = getattr(lidar, "points", None) if lidar is not None else None
                 if pts is None or len(pts) == 0:
                     return None
+                # The cloud is in the sensor frame. Both plots are in the map
+                # frame; Tk transforms with to_map before drawing or converting to s-d.
+                if hasattr(lidar, "to_map"):
+                    mapped = lidar.to_map(pts, stack.ego_state)
+                    if mapped is None or len(mapped) == 0:
+                        return None
+                    pts = mapped
                 arr = np.asarray(pts, dtype=float)
                 if arr.ndim == 2 and arr.shape[1] >= 2:
                     return np.array(arr[:, :2], copy=True)
@@ -1938,7 +2285,9 @@ def _install_widgets() -> None:
                 self._curve_cache["lidar_sd"] = 0
 
         def _paint_clusters(self, stack, gt, s) -> None:
-            xy = _cluster_xy(stack.pm) if s.p66_show_lidar_clusters.get() and self._xy_on else None
+            # Clusters are map-frame already. A Frenet-only profile still shows them.
+            want_clusters = bool(s.p66_show_lidar_clusters.get()) and (self._xy_on or self._frenet_on)
+            xy = _cluster_xy(stack.pm) if want_clusters else None
             if xy is None or len(xy) == 0:
                 if self._curve_cache.get("clu") != 0:
                     self.xy_clusters.setData([], [])
@@ -1970,60 +2319,26 @@ def _install_widgets() -> None:
         def _paint_predictions(self, stack, ego, gt, s) -> None:
             pred = getattr(stack.pm, "prediction", None) if stack.pm is not None else None
             show = bool(s.p67_show_prediction.get()) and pred is not None
-            modes = _forecast_modes(pred) if show else []
+            lines, rings = _prediction_drawings(pred, _agent_list(stack.pm), ego) if show else ([], [])
             token = (
                 show, self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
-                id(pred) if pred is not None else 0, _paths_token([m[2] for m in modes]),
+                id(pred) if pred is not None else 0, len(lines), len(rings),
             )
             if self._curve_cache.get("pred") == token:
                 return
             self._curve_cache["pred"] = token
-            ahead_xy: list[np.ndarray] = []
-            behind_xy: list[np.ndarray] = []
-            ellipses: list[np.ndarray] = []
-            if modes:
-                agents = {getattr(a, "agent_id", i): a for i, a in enumerate(_agent_list(stack.pm))}
-                heading = np.array([np.cos(float(ego.theta)), np.sin(float(ego.theta))])
-                for aid, mode, path, weight in modes:
-                    agent = agents.get(aid)
-                    pose = np.array([[float(agent.x), float(agent.y)]]) if agent is not None else path[:1]
-                    full = np.vstack([pose, path]) if len(path) else path
-                    ahead = True
-                    if agent is not None:
-                        to_agent = np.array([float(agent.x) - float(ego.x), float(agent.y) - float(ego.y)])
-                        ahead = float(np.dot(heading, to_agent)) >= 0.0
-                    (ahead_xy if ahead else behind_xy).append(full)
-                    if weight <= 0.0 or len(path) == 0:
-                        continue
-                    step = len(path) - 1
-                    cov = _step_covariance(pred, aid, mode, step)
-                    if cov is None:
-                        continue
-                    poly = _ellipse_polygon(path[step], cov, 0.5)
-                    if poly is not None:
-                        ellipses.append(poly)
-            ax, ay = _nan_join(ahead_xy)
-            bx, by = _nan_join(behind_xy)
-            ex, ey = _nan_join(ellipses)
             if self._xy_on:
-                self.xy_pred.setData(ax, ay)
-                self.xy_pred_behind.setData(bx, by)
-                self.xy_ellipses.setData(ex, ey)
+                self.xy_pred.set_drawings(lines, rings)
             else:
-                self.xy_pred.setData([], [])
-                self.xy_pred_behind.setData([], [])
-                self.xy_ellipses.setData([], [])
-            counted = np.concatenate([ax, bx]) if ax.size or bx.size else ax
-            self._count("prediction_xy", counted if self._xy_on else [])
-            self._count("prediction_ellipses", ex if self._xy_on else [])
+                self.xy_pred.clear()
+            xs = np.concatenate([np.asarray(pts)[:, 0] for pts, _color in lines]) if lines else []
+            ring_x = np.concatenate([np.asarray(pts)[:, 0] for pts, _color in rings]) if rings else []
+            self._count("prediction_xy", xs if self._xy_on else [])
+            self._count("prediction_ellipses", ring_x if self._xy_on else [])
             if self._frenet_on and gt is not None:
-                self.sd_pred.setData(*_nan_join([_to_sd(gt, p) for p in ahead_xy]))
-                self.sd_pred_behind.setData(*_nan_join([_to_sd(gt, p) for p in behind_xy]))
-                self.sd_ellipses.setData(*_nan_join([_to_sd(gt, p) for p in ellipses]))
+                self.sd_pred.set_drawings(_map_drawings(lines, gt), _map_drawings(rings, gt))
             else:
-                self.sd_pred.setData([], [])
-                self.sd_pred_behind.setData([], [])
-                self.sd_ellipses.setData([], [])
+                self.sd_pred.clear()
 
         def _set_image(self, item, grid, origin_x, origin_y, resolution, lut=None) -> None:
             image = np.asarray(grid, dtype=float)

@@ -1,11 +1,12 @@
 # Runtime dependencies for the Qt5 visualizer (Python 3.10+).
-# Install into the same environment as AVLite. AVLite itself is not listed;
-# `pip install avlite` first, then `pip install -r requirements.txt`.
+# `avlite>=0.6.7` is the first release whose plugin settings, app bootstrap,
+# and executer step match this package. Newer dev builds stay allowed.
 #
-# These are the third-party modules this package imports while running
-# (stdlib and avlite are omitted). PyQt5's wheel pulls PyQt5-Qt5 and
-# PyQt5-sip. pyqtgraph's wheel pulls colorama. OpenGL plots use Qt's
-# QOpenGLWidget; this package does not import PyOpenGL.
+# PyQt5's wheel pulls PyQt5-Qt5 and PyQt5-sip. pyqtgraph's wheel pulls
+# colorama. OpenGL plots use Qt's QOpenGLWidget; this package does not
+# import PyOpenGL.
+
+avlite>=0.6.7
 
 # qt_binding.import_qt. 5.15.6 is the first 5.15 release with abi3 wheels
 # that install on Python 3.10+.

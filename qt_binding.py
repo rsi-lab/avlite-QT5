@@ -30,7 +30,7 @@ def import_qt():
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
             "PyQt5 is required for the AVLite Qt visualizer.\n"
-            "  pip install -r avlite-app-visualizer-qt/requirements.txt"
+            "  pip install -r requirements.txt"
         ) from exc
     return QtCore, QtGui, QtWidgets
 

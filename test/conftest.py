@@ -16,6 +16,10 @@ PLUGIN_NAME = "avlite-QT5"
 
 
 def ensure_plugin_loaded() -> None:
+    # Community import attaches this checkout's parent to ``avlite.plugins``.
+    # The builtin package has to be on that path first, which ``avlite qt5``
+    # does while bootstrapping built-in apps.
+    import avlite.plugins  # noqa: F401
     from avlite.c60_apps.c63_plugins import import_plugin_modules
 
     import_plugin_modules(str(PLUGIN_DIR), pkg_name=PLUGIN_NAME)
@@ -24,6 +28,18 @@ def ensure_plugin_loaded() -> None:
 @pytest.fixture(scope="session", autouse=True)
 def _load_plugin():
     ensure_plugin_loaded()
+
+
+@pytest.fixture(autouse=True)
+def _offline_plugin_registry(monkeypatch):
+    """Keep settings and browser tests off the GitHub registry."""
+    from avlite.plugins.p60_visualizer_tk import p63_plugins_app as plugins
+
+    monkeypatch.setattr(plugins._PluginOperations, "fetch_registry", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        plugins._PluginOperations, "check_plugin_update", lambda *_args, **_kwargs: "unknown",
+    )
+    monkeypatch.setattr(plugins._GitHubClient, "_load_github_token", lambda: None)
 
 
 def pytest_runtest_setup(item):
@@ -51,7 +67,11 @@ def window(qapp, tmp_path, monkeypatch):
     from avlite.plugins.avlite_QT5.main_window import VisualizerQtWindow
 
     monkeypatch.setenv("AVLITE_CONFIG_DIR", str(tmp_path))
+    from avlite.c60_apps.c65_setting_utils import list_profiles
+
+    list_profiles(AppSettings)
     load_setting(AppSettings, profile="default")
+    AppSettings.c60_selected_profile = "default"
     AppSettings.c62_load_plugins = True
     AppSettings.c62_community_plugins = {PLUGIN_NAME: str(PLUGIN_DIR)}
     load_stack_settings(profile="default", load_plugins=True)

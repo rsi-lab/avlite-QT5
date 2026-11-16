@@ -17,6 +17,7 @@ def test_track_frenet_is_not_reconverted_every_frame(window):
 
     gt.convert_xy_path_to_sd_path_np = wrapped
     try:
+        window.setting.p67_show_local_global_view.set(True)
         window.update_ui()
         after_first = len(calls)
         large = sum(1 for n in calls if n > 80)

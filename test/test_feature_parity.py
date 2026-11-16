@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -54,9 +55,13 @@ def test_global_plan_boundaries(window):
 
 @pytest.mark.requires_data
 def test_local_ego_box(window):
+    window.setting.p67_show_local_global_view.set(True)
     window.update_ui()
     xs, ys = window.local_plot.xy_ego.getData()
     assert len(xs) >= 4 and len(ys) >= 4
+    # Tk fills the ego with azure. A dark-blue outline alone disappears on #333333.
+    assert window.local_plot.xy_bodies.bodies
+    assert window.local_plot.xy_bodies.bodies[0][1][:3] == (240, 255, 255)
 
 
 @pytest.mark.requires_data
@@ -248,8 +253,13 @@ def test_view_toggles(window):
     assert window.local_plot.frenet_plot.isHidden()
     window.setting.p67_global_plan_view.set(True)
     window.setting.p67_show_local_frenet_view.set(True)
+    window.setting.p67_show_control_view.set(False)
     window.update_views()
     assert not window.global_plot.isHidden()
+    assert window.control_plot.isHidden()
+    window.setting.p67_show_control_view.set(True)
+    window.update_views()
+    assert not window.control_plot.isHidden()
 
 
 @pytest.mark.requires_data
@@ -276,11 +286,22 @@ def test_log_panel_clear_and_filter(window):
 
 @pytest.mark.requires_data
 def test_lidar_overlay_after_step(window):
+    window.setting.p67_show_local_global_view.set(True)
     window.setting.p66_show_lidar_global.set(True)
+    window.setting.p66_show_lidar_frenet.set(True)
+    window.setting.p67_show_local_frenet_view.set(True)
     window.stack_panels.execution.step_exec()
     window.update_ui()
     xs, ys = window.local_plot.xy_lidar.getData()
     assert xs is not None and len(xs) > 0 and len(ys) > 0
+    # Sensor-frame points sit near the origin. The plots use the map frame.
+    ego = window.exec.ego_state
+    near = np.hypot(np.asarray(xs, dtype=float) - ego.x, np.asarray(ys, dtype=float) - ego.y)
+    assert float(np.nanmin(near)) < 80.0
+    ss, dd = window.local_plot.sd_lidar.getData()
+    assert ss is not None and len(ss) > 0
+    sd = window.exec.local_planner.global_trajectory.convert_xy_to_sd(ego.x, ego.y)
+    assert abs(float(np.nanmedian(ss)) - float(sd[0])) < 80.0
 
 
 @pytest.mark.requires_data
