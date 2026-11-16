@@ -82,3 +82,54 @@ def test_profile_note_stays_quiet_when_empty(window, monkeypatch):
     window.loaded_profile = "other"
     window.load_settings(profile="default")
     assert shown == []
+
+
+def test_gauge_labels_stay_clear_as_the_pane_changes(qapp):
+    """Tick, caption, and g-g text stay inside the widget and off the arc and the spokes."""
+    import math
+
+    from avlite.plugins.avlite_QT5.control_plot import ControlPlot
+
+    def closest(rect, cx, cy):
+        x = min(max(cx, rect.left()), rect.right())
+        y = min(max(cy, rect.top()), rect.bottom())
+        return math.hypot(x - cx, y - cy)
+
+    for width, height in ((160, 150), (200, 180), (420, 640), (531, 383), (820, 560), (240, 720), (860, 220)):
+        plot = ControlPlot(None)
+        plot.resize(width, height)
+        plot.placed_size = (0, 0)
+        plot.place()
+        plot.speed_gauge.set(100.0, 10.0)
+        plot.steer_wheel.set(0.7)
+        plot.gg.show_trail([(12.0, -18.0), (6.0, 9.0), (-8.0, 14.0)], 20.0)
+        plot.grab()
+        for gauge in (plot.speed_gauge, plot.steer_wheel, plot.gg):
+            rects = gauge.label_rects
+            assert rects, (width, height, gauge.objectName())
+            for rect in rects:
+                assert rect.left() >= -1.0
+                assert rect.top() >= -1.0
+                assert rect.right() <= gauge.width() + 1.0
+                assert rect.bottom() <= gauge.height() + 1.0
+            for index, left in enumerate(rects):
+                for right in rects[index + 1 :]:
+                    assert not left.intersects(right), (width, height, gauge.objectName())
+        dial = plot.speed_gauge
+        cx, cy = dial.arc_center
+        captions = [rect for rect in dial.label_rects if rect.center().y() >= dial.dial_px]
+        assert len(captions) == 2
+        assert all(rect.top() >= dial.dial_px - 1.0 for rect in captions)
+        for rect in dial.label_rects:
+            if rect.center().y() >= dial.dial_px:
+                continue
+            assert closest(rect, cx, cy) + 0.6 >= dial.arc_outer
+        wheel = plot.steer_wheel
+        assert wheel.label_inner > wheel.spoke_outer + 0.5
+        assert dial.caption().endswith("km/h")
+        assert dial.caption_mps().endswith("m/s")
+        assert wheel.caption().endswith("rad")
+        if min(width, height) >= 180:
+            assert len(dial.label_rects) >= 9
+            assert len(wheel.label_rects) >= 4
+            assert len(plot.gg.label_rects) >= 6

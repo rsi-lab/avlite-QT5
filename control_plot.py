@@ -70,20 +70,92 @@ def _courier(point_size: int):
     font = QtGui.QFont("Courier")
     font.setStyleHint(QtGui.QFont.TypeWriter)
     font.setFixedPitch(True)
-    font.setPointSize(max(6, int(point_size)))
+    # A fixed floor would overflow a small pane. The dial fit refuses a size that does not clear.
+    font.setPointSize(max(1, int(point_size)))
     return font
 
 
-def _caption_heights(dial: int) -> tuple[int, int]:
-    """Pixel height under the speed dial (km/h plus m/s) and under the wheel."""
+def _pane_point(dial: int, base: float) -> int:
+    """Tk's point size on a 96 px dial, grown and shrunk with the pane."""
+    return max(1, int(round(base * max(int(dial), 1) / 96.0)))
+
+
+def _inset(dial: int) -> float:
+    """Tick and spoke gaps were authored on Tk's 148 px dial."""
+    return max(int(dial), 1) / 148.0
+
+
+def _at(cx: float, cy: float, radius: float, deg: float) -> tuple[float, float]:
+    rad = math.radians(deg)
+    return cx + radius * math.cos(rad), cy - radius * math.sin(rad)
+
+
+def _label_inside(metrics, text: str, deg: float, outer: float) -> tuple[float, float]:
+    """Center radius, and how far the glyph reaches, so the ink stays inside ``outer``."""
+    half_w = metrics.horizontalAdvance(text) / 2.0 + 1.0
+    half_h = metrics.height() / 2.0
+    rad = math.radians(deg)
+    extent = half_w * abs(math.cos(rad)) + half_h * abs(math.sin(rad))
+    return outer - extent, extent
+
+
+def _draw_centered(painter, font, text: str, x: float, y: float):
+    """Draw ``text`` on its baseline, centered on ``(x, y)``, and return the ink rectangle.
+
+    A fixed box clips a font that has scaled up with the pane, and a box larger than
+    the glyph covers the arc even when the letters themselves would fit.
+    """
+    from .qt_binding import import_qt
+
+    QtCore, QtGui, _QtWidgets = import_qt()
+    painter.setFont(font)
+    metrics = QtGui.QFontMetrics(font)
+    width = float(metrics.horizontalAdvance(text))
+    height = float(metrics.height())
+    baseline = y - height / 2.0 + metrics.ascent()
+    painter.drawText(QtCore.QPointF(x - width / 2.0, baseline), text)
+    return QtCore.QRectF(x - width / 2.0, y - height / 2.0, width, height)
+
+
+def _rects_clear(rects, gap: float) -> bool:
+    for index, left in enumerate(rects):
+        grown = left.adjusted(-gap, -gap, gap, gap)
+        for right in rects[index + 1 :]:
+            if grown.intersects(right):
+                return False
+    return True
+
+
+def _inside(rect, width: float, height: float, margin: float = 0.5) -> bool:
+    return (
+        rect.left() >= margin
+        and rect.top() >= margin
+        and rect.right() <= width - margin
+        and rect.bottom() <= height - margin
+    )
+
+
+def _gg_margins(dial: int) -> tuple[int, int]:
+    """Side and top bands for the live g readout. Measured, so the text is not clipped."""
     from .qt_binding import import_qt
 
     _QtCore, QtGui, _QtWidgets = import_qt()
-    scale = max(int(dial), 1) / 96.0
-    kmh = QtGui.QFontMetrics(_courier(round(11 * scale))).height()
-    mps = QtGui.QFontMetrics(_courier(max(7, round(9 * scale)))).height()
-    steer = QtGui.QFontMetrics(_courier(round(11 * scale))).height()
-    return kmh + mps + 4, steer + 4
+    metrics = QtGui.QFontMetrics(_courier(_pane_point(dial, 8)))
+    return metrics.horizontalAdvance("-00.0") + 12, metrics.height() + 4
+
+
+def _gauge_chrome(dial: int) -> tuple[int, int, int, int, int, int]:
+    """Speed width, speed caption height, steer width, steer caption height, g-g side, g-g top."""
+    from .qt_binding import import_qt
+
+    _QtCore, QtGui, _QtWidgets = import_qt()
+    kmh = QtGui.QFontMetrics(_courier(_pane_point(dial, 11)))
+    mps = QtGui.QFontMetrics(_courier(_pane_point(dial, 9)))
+    steer = QtGui.QFontMetrics(_courier(_pane_point(dial, 11)))
+    speed_w = max(kmh.horizontalAdvance("-999.9 km/h"), mps.horizontalAdvance("-999.9 m/s")) + 8
+    steer_w = steer.horizontalAdvance("-0.70 rad") + 8
+    side, top = _gg_margins(dial)
+    return speed_w, kmh.height() + mps.height() + 4, steer_w, steer.height() + 4, side, top
 
 
 def _install() -> None:
@@ -106,6 +178,9 @@ def _install() -> None:
             self.accel_min = -20.0
             self.accel_max = 10.0
             self.dial_px = 96
+            self.label_rects: list = []
+            self.arc_center = (0.0, 0.0)
+            self.arc_outer = 0.0
             self.setObjectName("speedGauge")
 
         def set(self, speed_mps: float, accel: float) -> None:
@@ -119,63 +194,89 @@ def _install() -> None:
         def caption_mps(self) -> str:
             return f"{self.speed:.1f} m/s"
 
+        def _label_plan(self, cx: float, cy: float, radius: float, k: float, max_kmh: float):
+            """Largest tick font that stays inside the ticks and leaves a ring inside the numbers."""
+            dial = max(1, self.dial_px)
+            major = _kmh_major_step(max_kmh)
+            minor = major / 2.0
+            count = int(round(max_kmh / minor)) if minor else 0
+            if count * minor > max_kmh + 0.05:
+                count -= 1
+            marks = []
+            for index in range(count + 1):
+                kmh = index * minor
+                deg = 210.0 - 240.0 * (kmh / max_kmh if max_kmh else 0.0)
+                marks.append((str(int(round(kmh))), deg, index % 2 == 0))
+            desired = max(2.0, min(12.0, 8.0 * math.sqrt(dial / 96.0)))
+            fallback = None
+            for point in range(_pane_point(dial, 7), 0, -1):
+                font = _courier(point)
+                metrics = QtGui.QFontMetrics(font)
+                rects = []
+                inner = radius
+                failed = False
+                for text, deg, is_major in marks:
+                    if not is_major:
+                        continue
+                    label_r, extent = _label_inside(metrics, text, deg, radius - 14.0 * k)
+                    if label_r < 4.0:
+                        failed = True
+                        break
+                    lx, ly = _at(cx, cy, label_r, deg)
+                    rect = QtCore.QRectF(
+                        lx - metrics.horizontalAdvance(text) / 2.0,
+                        ly - metrics.height() / 2.0,
+                        float(metrics.horizontalAdvance(text)),
+                        float(metrics.height()),
+                    )
+                    limit = dial - max(2.0, k)
+                    if rect.top() < 1 or rect.bottom() > limit or not _inside(rect, self.width(), self.height()):
+                        failed = True
+                        break
+                    inner = min(inner, label_r - extent)
+                    rects.append((text, deg, rect))
+                gap = max(2.0, metrics.height() * 0.12)
+                if failed or not _rects_clear([rect for _text, _deg, rect in rects], gap):
+                    continue
+                room = inner - gap
+                stroke = min(desired, max(1.5, room * 0.5))
+                arc_r = room - stroke / 2.0
+                if arc_r < 1.0:
+                    continue
+                plan = (font, rects, arc_r, stroke, marks)
+                if fallback is None:
+                    fallback = plan
+                if arc_r >= 0.22 * radius:
+                    return plan
+            if fallback is not None:
+                return fallback
+            return _courier(1), [], max(8.0, 0.45 * radius), 2.0, marks
+
         def paintEvent(self, _event) -> None:  # noqa: N802
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
             colors = _colors(self)
             dial = max(1, self.dial_px)
-            scale = dial / 96.0
+            k = _inset(dial)
             cx = self.width() / 2.0
-            cy = dial / 2.0 + 2.0 * scale
-            radius = dial / 2.0 - 4.0 * scale
-            painter.setPen(QtGui.QPen(colors["rim"], max(1.0, 2.0 * scale)))
+            cy = dial / 2.0 + k
+            radius = max(4.0, dial / 2.0 - 4.0 * k)
+            max_kmh = max(self.max_mps, 1e-3) * 3.6
+            font, labels, arc_r, stroke, marks = self._label_plan(cx, cy, radius, k, max_kmh)
+            self.arc_center = (cx, cy)
+            self.arc_outer = arc_r + stroke / 2.0
+
+            painter.setPen(QtGui.QPen(colors["rim"], max(1.0, 2.0 * k)))
             painter.setBrush(colors["face"])
             painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
-
-            max_kmh = self.max_mps * 3.6
-            major = _kmh_major_step(max_kmh)
-            minor = major / 2.0
-            ticks = int(round(max_kmh / minor))
-            if ticks * minor > max_kmh + 0.05:
-                ticks -= 1
-            tick_font = _courier(round(7 * scale))
-            painter.setFont(tick_font)
-            metrics = QtGui.QFontMetrics(tick_font)
-            inner_for_labels = radius
-            for i in range(ticks + 1):
-                if i % 2:
-                    continue
-                text = str(int(round(i * minor)))
-                deg = 210.0 - 240.0 * ((i * minor) / max_kmh)
-                rad = math.radians(deg)
-                half_w = metrics.horizontalAdvance(text) / 2.0 + 1.0
-                half_h = metrics.height() / 2.0
-                extent = half_w * abs(math.cos(rad)) + half_h * abs(math.sin(rad))
-                inner_for_labels = min(inner_for_labels, radius - 14.0 * scale - extent)
-            arc_r = max(inner_for_labels - 6.0 * scale, 0.42 * radius)
-
-            def at(r, deg):
-                rad = math.radians(deg)
-                return cx + r * math.cos(rad), cy - r * math.sin(rad)
-
-            for i in range(ticks + 1):
-                kmh = i * minor
-                deg = 210.0 - 240.0 * (kmh / max_kmh)
-                is_major = i % 2 == 0
-                outer = radius - 3.0 * scale
-                inner = radius - (12.0 if is_major else 9.0) * scale
-                x0, y0 = at(inner, deg)
-                x1, y1 = at(outer, deg)
-                painter.setPen(QtGui.QPen(colors["ink"] if is_major else colors["muted"], max(1.0, (2.0 if is_major else 1.0) * scale)))
+            for text, deg, is_major in marks:
+                outer = radius - 3.0 * k
+                inner = radius - (12.0 if is_major else 9.0) * k
+                x0, y0 = _at(cx, cy, inner, deg)
+                x1, y1 = _at(cx, cy, outer, deg)
+                painter.setPen(QtGui.QPen(colors["ink"] if is_major else colors["muted"], max(1.0, (2.0 if is_major else 1.0) * k)))
                 painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
-                if is_major:
-                    label_r = inner - 2.0 * scale - (
-                        metrics.horizontalAdvance(str(int(round(kmh)))) / 2.0 * abs(math.cos(math.radians(deg)))
-                        + metrics.height() / 2.0 * abs(math.sin(math.radians(deg)))
-                    )
-                    lx, ly = at(max(8.0, label_r), deg)
-                    painter.setPen(colors["ink"])
-                    painter.drawText(QtCore.QRectF(lx - 24, ly - 10, 48, 20), QtCore.Qt.AlignCenter, str(int(round(kmh))))
 
             def arc(radius_px, frac, color, width):
                 frac = max(0.0, min(1.0, frac))
@@ -184,44 +285,45 @@ def _install() -> None:
                 rect = QtCore.QRectF(cx - radius_px, cy - radius_px, radius_px * 2.0, radius_px * 2.0)
                 pen = QtGui.QPen(color, width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
                 painter.setPen(pen)
+                painter.setBrush(QtCore.Qt.NoBrush)
                 painter.drawArc(rect, 210 * 16, int(-240 * 16 * frac))
 
-            painter.setBrush(QtCore.Qt.NoBrush)
-            arc(arc_r, 1.0, colors["track"], max(2.0, 3.0 * scale))
-            shown = min(max(self.speed, 0.0), self.max_mps) / self.max_mps
-            arc(arc_r, shown, colors["accent"], max(3.0, 8.0 * scale))
+            arc(arc_r, 1.0, colors["track"], max(1.5, stroke * 0.4))
+            shown = min(max(self.speed, 0.0), self.max_mps) / max(self.max_mps, 1e-3)
+            arc(arc_r, shown, colors["accent"], stroke)
             if self.accel >= 0.0:
                 accel_frac = self.accel / max(self.accel_max, 1e-3)
                 accel_color = colors["throttle"]
             else:
                 accel_frac = -self.accel / max(abs(self.accel_min), 1e-3)
                 accel_color = colors["neg"]
-            arc(arc_r * 0.7, accel_frac, accel_color, max(2.0, 3.0 * scale))
+            accel_w = max(1.5, stroke * 0.4)
+            arc(max(4.0, arc_r * 0.7), accel_frac, accel_color, accel_w)
 
-            tip_x, tip_y = at(arc_r - scale, 210.0 - 240.0 * shown)
-            painter.setPen(QtGui.QPen(colors["ink"], max(1.5, 2.0 * scale), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            tip_x, tip_y = _at(cx, cy, max(0.0, arc_r - k), 210.0 - 240.0 * shown)
+            painter.setPen(QtGui.QPen(colors["ink"], max(1.5, 2.0 * k), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
             painter.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(tip_x, tip_y))
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(colors["neg"] if self.speed < 0.0 else colors["accent"])
-            painter.drawEllipse(QtCore.QPointF(cx, cy), 3.5 * scale, 3.5 * scale)
+            painter.drawEllipse(QtCore.QPointF(cx, cy), max(2.0, 3.5 * k), max(2.0, 3.5 * k))
+
+            # Numbers are drawn after the arc and the needle so a thick stroke cannot cover them.
+            painter.setPen(colors["ink"])
+            drawn = []
+            for text, deg, _rect in labels:
+                label_r, _extent = _label_inside(QtGui.QFontMetrics(font), text, deg, radius - 14.0 * k)
+                lx, ly = _at(cx, cy, label_r, deg)
+                drawn.append(_draw_centered(painter, font, text, lx, ly))
 
             caption_fill = colors["neg"] if self.speed < 0.0 else colors["ink"]
-            kmh_font = _courier(round(11 * scale))
-            mps_font = _courier(max(7, round(9 * scale)))
+            kmh_font = _courier(_pane_point(dial, 11))
+            mps_font = _courier(_pane_point(dial, 9))
             kmh_h = QtGui.QFontMetrics(kmh_font).height()
-            painter.setFont(kmh_font)
+            mps_h = QtGui.QFontMetrics(mps_font).height()
             painter.setPen(caption_fill)
-            painter.drawText(
-                QtCore.QRectF(0, dial, self.width(), kmh_h),
-                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
-                self.caption(),
-            )
-            painter.setFont(mps_font)
-            painter.drawText(
-                QtCore.QRectF(0, dial + kmh_h, self.width(), self.height() - dial - kmh_h),
-                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop,
-                self.caption_mps(),
-            )
+            drawn.append(_draw_centered(painter, kmh_font, self.caption(), cx, dial + kmh_h / 2.0))
+            drawn.append(_draw_centered(painter, mps_font, self.caption_mps(), cx, dial + kmh_h + mps_h / 2.0))
+            self.label_rects = drawn
 
     class SteerWheel(QtWidgets.QWidget):
         """Wheel whose top mark rotates with the steer command. Positive is left."""
@@ -231,6 +333,9 @@ def _install() -> None:
             self.steer = 0.0
             self.limit = 0.7
             self.dial_px = 96
+            self.label_rects: list = []
+            self.spoke_outer = 0.0
+            self.label_inner = 0.0
             self.setObjectName("steerWheel")
 
         def set(self, steer: float) -> None:
@@ -240,70 +345,104 @@ def _install() -> None:
         def caption(self) -> str:
             return f"{self.steer:+.2f} rad"
 
+        def _label_plan(self, cx: float, cy: float, radius: float, k: float):
+            """Largest 0 / + / − font that stays off the spokes and inside the rim."""
+            dial = max(1, self.dial_px)
+            names = ((90.0, "0"), (210.0, "+"), (-30.0, "−"))
+            hub_r = radius * 0.22
+            accent_w = max(2.0, 6.0 * k)
+            for point in range(_pane_point(dial, 7), 0, -1):
+                font = _courier(point)
+                metrics = QtGui.QFontMetrics(font)
+                placed = []
+                inner_edge = radius
+                failed = False
+                for deg, text in names:
+                    label_r, extent = _label_inside(metrics, text, deg, radius - 12.0 * k)
+                    edge = label_r - extent
+                    if edge < hub_r + accent_w / 2.0 + 2.0 * k:
+                        failed = True
+                        break
+                    lx, ly = _at(cx, cy, label_r, deg)
+                    rect = QtCore.QRectF(
+                        lx - metrics.horizontalAdvance(text) / 2.0,
+                        ly - metrics.height() / 2.0,
+                        float(metrics.horizontalAdvance(text)),
+                        float(metrics.height()),
+                    )
+                    if rect.bottom() > dial - max(2.0, k) or not _inside(rect, self.width(), self.height()):
+                        failed = True
+                        break
+                    inner_edge = min(inner_edge, edge)
+                    placed.append((text, deg, rect))
+                gap = max(2.0, metrics.height() * 0.1)
+                if failed or not _rects_clear([rect for _text, _deg, rect in placed], gap):
+                    continue
+                # Tk stops the spokes well short of the letters. A scaled font can sit closer, so stop early.
+                spoke_outer = min(radius - 34.0 * k, inner_edge - accent_w / 2.0 - max(1.5, 2.0 * k))
+                if spoke_outer <= hub_r + 2.0 * k:
+                    continue
+                return font, placed, spoke_outer, inner_edge, accent_w, hub_r
+            return _courier(1), [], hub_r + 4.0, radius, accent_w, hub_r
+
         def paintEvent(self, _event) -> None:  # noqa: N802
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
             colors = _colors(self)
             dial = max(1, self.dial_px)
-            scale = dial / 96.0
+            k = _inset(dial)
             cx = self.width() / 2.0
-            cy = dial / 2.0 + 6.0 * scale
-            radius = dial / 2.0 - 18.0 * scale
-            painter.setPen(QtGui.QPen(colors["rim"], max(2.0, 5.0 * scale)))
+            cy = dial / 2.0 + 6.0 * k
+            radius = max(8.0, dial / 2.0 - 18.0 * k)
+            font, labels, spoke_outer, label_inner, accent_w, hub_r = self._label_plan(cx, cy, radius, k)
+            self.spoke_outer = spoke_outer
+            self.label_inner = label_inner
+
+            painter.setPen(QtGui.QPen(colors["rim"], max(2.0, 5.0 * k)))
             painter.setBrush(colors["face"])
             painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
-
-            def at(r, deg):
-                rad = math.radians(deg)
-                return cx + r * math.cos(rad), cy - r * math.sin(rad)
-
-            tick_font = _courier(round(7 * scale))
-            painter.setFont(tick_font)
-            metrics = QtGui.QFontMetrics(tick_font)
-            for deg, label in ((90.0, "0"), (210.0, "+"), (-30.0, "−")):
-                x0, y0 = at(radius - 10.0 * scale, deg)
-                x1, y1 = at(radius - 3.0 * scale, deg)
-                painter.setPen(QtGui.QPen(colors["muted"], max(1.0, 2.0 * scale)))
+            for _text, deg, _rect in labels:
+                x0, y0 = _at(cx, cy, radius - 10.0 * k, deg)
+                x1, y1 = _at(cx, cy, radius - 3.0 * k, deg)
+                painter.setPen(QtGui.QPen(colors["muted"], max(1.0, 2.0 * k)))
                 painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
-                rad = math.radians(deg)
-                extent = metrics.horizontalAdvance(label) / 2.0 + metrics.height() / 2.0
-                lx, ly = at(radius - 12.0 * scale - extent, deg)
-                painter.setPen(colors["ink"])
-                painter.drawText(QtCore.QRectF(lx - 16, ly - 10, 32, 20), QtCore.Qt.AlignCenter, label)
 
             frac = max(-1.0, min(1.0, self.steer / max(self.limit, 1e-3)))
             rotation = frac * 120.0
-            inner = radius * 0.22
-            outer = radius - 8.0 * scale
-            painter.setPen(QtGui.QPen(colors["ink"], max(1.5, 2.0 * scale), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            painter.setPen(QtGui.QPen(colors["ink"], max(1.5, 2.0 * k), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
             for spoke in range(3):
                 deg = 90.0 + rotation + spoke * 120.0
-                x0, y0 = at(inner, deg)
-                x1, y1 = at(outer, deg)
+                x0, y0 = _at(cx, cy, hub_r, deg)
+                x1, y1 = _at(cx, cy, spoke_outer, deg)
                 painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
-            x0, y0 = at(inner + 4.0 * scale, 90.0 + rotation)
-            x1, y1 = at(outer, 90.0 + rotation)
-            painter.setPen(QtGui.QPen(colors["accent"], max(3.0, 6.0 * scale), QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+            x0, y0 = _at(cx, cy, hub_r + 4.0 * k, 90.0 + rotation)
+            x1, y1 = _at(cx, cy, spoke_outer, 90.0 + rotation)
+            painter.setPen(QtGui.QPen(colors["accent"], accent_w, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
             painter.drawLine(QtCore.QPointF(x0, y0), QtCore.QPointF(x1, y1))
-            painter.setPen(QtGui.QPen(colors["rim"], max(1.0, scale)))
+            painter.setPen(QtGui.QPen(colors["rim"], max(1.0, k)))
             painter.setBrush(colors["track"])
-            painter.drawEllipse(QtCore.QPointF(cx, cy), inner, inner)
-            tip_y = cy - radius - 2.0 * scale
+            painter.drawEllipse(QtCore.QPointF(cx, cy), hub_r, hub_r)
+            tip_y = cy - radius - 2.0 * k
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(colors["muted"])
             painter.drawPolygon(QtGui.QPolygonF([
-                QtCore.QPointF(cx - 3.5 * scale, tip_y - 6.0 * scale),
-                QtCore.QPointF(cx + 3.5 * scale, tip_y - 6.0 * scale),
+                QtCore.QPointF(cx - 3.5 * k, tip_y - 6.0 * k),
+                QtCore.QPointF(cx + 3.5 * k, tip_y - 6.0 * k),
                 QtCore.QPointF(cx, tip_y),
             ]))
 
-            painter.setFont(_courier(round(11 * scale)))
             painter.setPen(colors["ink"])
-            painter.drawText(
-                QtCore.QRectF(0, dial, self.width(), self.height() - dial),
-                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter,
-                self.caption(),
-            )
+            drawn = []
+            for text, deg, _rect in labels:
+                label_r, _extent = _label_inside(QtGui.QFontMetrics(font), text, deg, radius - 12.0 * k)
+                lx, ly = _at(cx, cy, label_r, deg)
+                drawn.append(_draw_centered(painter, font, text, lx, ly))
+            caption_font = _courier(_pane_point(dial, 11))
+            caption_h = float(QtGui.QFontMetrics(caption_font).height())
+            band = max(caption_h, float(self.height() - dial))
+            drawn.append(_draw_centered(painter, caption_font, self.caption(), cx, dial + band / 2.0))
+            self.label_rects = drawn
 
     class GGDiagram(QtWidgets.QWidget):
         """Three rings and a short trail of lateral and longitudinal acceleration."""
@@ -312,6 +451,8 @@ def _install() -> None:
             super().__init__(parent)
             self.trail: list[tuple[float, float]] = []
             self.limit = 20.0
+            self.dial_px = 96
+            self.label_rects: list = []
             self.setObjectName("ggDiagram")
 
         def show_trail(self, trail: list[tuple[float, float]], limit: float) -> None:
@@ -319,24 +460,98 @@ def _install() -> None:
             self.limit = max(float(limit), 1e-3)
             self.update()
 
+        def _readout(self) -> tuple[str, str]:
+            if self.trail:
+                lateral, longitudinal = self.trail[-1]
+                return f"{longitudinal / _G:+.1f}", f"{lateral / _G:+.1f}"
+            return "0.0", "0.0"
+
+        def _label_plan(self, cx: float, cy: float, radius: float, outer_g: float):
+            """Ring numbers and the two live readouts, scaled down until none of them meet."""
+            dial = max(1, self.dial_px)
+            slant = 2 ** -0.5
+            long_text, lat_text = self._readout()
+            width = float(self.width())
+            height = float(self.height())
+
+            def attempt(point: int, rings: bool):
+                font = _courier(point)
+                metrics = QtGui.QFontMetrics(font)
+                roomy = radius / 3.0 * slant >= metrics.height() + 1
+                if rings and not roomy:
+                    return None
+                steps = (1, 2, 3) if rings else ()
+                items = []
+                for step in steps:
+                    ring = radius * step / 3.0
+                    text = f"{outer_g * step / 3.0:.1f}"
+                    rect = QtCore.QRectF(
+                        cx - ring * slant - metrics.horizontalAdvance(text) / 2.0,
+                        cy - ring * slant - metrics.height() / 2.0,
+                        float(metrics.horizontalAdvance(text)),
+                        float(metrics.height()),
+                    )
+                    items.append((text, rect, True))
+                center = QtCore.QRectF(
+                    cx - metrics.horizontalAdvance("0.0") / 2.0,
+                    cy - metrics.height() / 2.0,
+                    float(metrics.horizontalAdvance("0.0")),
+                    float(metrics.height()),
+                )
+                items.append(("0.0", center, True))
+                line = float(metrics.height())
+                long_w = float(metrics.horizontalAdvance(long_text))
+                lat_w = float(metrics.horizontalAdvance(lat_text))
+                long_rect = QtCore.QRectF(cx - long_w / 2.0, cy - radius - 3.0 - line, long_w, line)
+                lat_rect = QtCore.QRectF(cx + radius + 10.0, cy - line / 2.0, lat_w, line)
+                items.append((long_text, long_rect, False))
+                items.append((lat_text, lat_rect, False))
+                rects = [rect for _text, rect, _faint in items]
+                if any(not _inside(rect, width, height) for rect in rects):
+                    return None
+                if not _rects_clear(rects, 1.0):
+                    return None
+                return font, items
+
+            target = _pane_point(dial, 8)
+            for point in range(target, 0, -1):
+                plan = attempt(point, rings=True)
+                if plan is not None:
+                    return plan
+            for point in range(target, 0, -1):
+                plan = attempt(point, rings=False)
+                if plan is not None:
+                    return plan
+            font = _courier(1)
+            return font, []
+
         def paintEvent(self, _event) -> None:  # noqa: N802
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
             colors = _colors(self)
             painter.fillRect(self.rect(), colors["face"])
-            font = _courier(8)
-            painter.setFont(font)
-            metrics = QtGui.QFontMetrics(font)
-            side_m = metrics.horizontalAdvance("-0.0") + 12
-            top_m = metrics.height() + 4
-            radius = min(self.width() - 2 * side_m, self.height() - top_m) / 2.0 - 4.0
-            if radius < 12:
+            if self.width() < 8 or self.height() < 8:
+                self.label_rects = []
                 return
+            dial = max(1, self.dial_px)
+            side_m, top_m = _gg_margins(dial)
+            radius = min(self.width() - 2 * side_m, self.height() - top_m) / 2.0 - 4.0
             cx = self.width() / 2.0
             cy = (self.height() + top_m) / 2.0
             outer_g = max(1.0, float(math.ceil(self.limit / _G)))
-            slant = 2 ** -0.5
-            roomy = radius / 3.0 * slant >= metrics.height() + 1
+            if radius < 8.0:
+                long_text, lat_text = self._readout()
+                font = _courier(_pane_point(dial, 8))
+                painter.setPen(colors["ink"])
+                line = float(QtGui.QFontMetrics(font).height())
+                self.label_rects = [
+                    _draw_centered(painter, font, long_text, cx, line / 2.0 + 1.0),
+                    _draw_centered(painter, font, lat_text, cx, line * 1.5 + 2.0),
+                ]
+                return
+            font, items = self._label_plan(cx, cy, radius, outer_g)
+            dot = max(1.5, min(2.5, 2.0 * dial / 96.0))
             painter.setBrush(QtCore.Qt.NoBrush)
             for step in range(1, 4):
                 ring = radius * step / 3.0
@@ -346,51 +561,34 @@ def _install() -> None:
                 painter.setPen(QtCore.Qt.NoPen)
                 painter.setBrush(colors["ink"])
                 for dx, dy in ((0.0, -ring), (ring, 0.0), (0.0, ring), (-ring, 0.0)):
-                    painter.drawEllipse(QtCore.QPointF(cx + dx, cy + dy), 2.0, 2.0)
-                if roomy or step == 3:
-                    text = f"{outer_g * step / 3.0:.1f}"
-                    tx = cx - ring * slant
-                    ty = cy - ring * slant
-                    painter.setPen(colors["faint"])
-                    painter.drawText(QtCore.QRectF(tx - 18, ty - 8, 36, 16), QtCore.Qt.AlignCenter, text)
-            painter.setPen(colors["faint"])
-            painter.drawText(QtCore.QRectF(cx - 16, cy - 8, 32, 16), QtCore.Qt.AlignCenter, "0.0")
-
-            if self.trail:
-                lateral, longitudinal = self.trail[-1]
-                long_text = f"{longitudinal / _G:+.1f}"
-                lat_text = f"{lateral / _G:+.1f}"
-            else:
-                long_text = lat_text = "0.0"
-            painter.setPen(colors["ink"])
-            painter.drawText(
-                QtCore.QRectF(cx - 28, cy - radius - metrics.height() - 2, 56, metrics.height()),
-                QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom,
-                long_text,
-            )
-            painter.drawText(
-                QtCore.QRectF(cx + radius + 6, cy - metrics.height() / 2.0, side_m, metrics.height()),
-                QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
-                lat_text,
-            )
+                    painter.drawEllipse(QtCore.QPointF(cx + dx, cy + dy), dot, dot)
             span = outer_g * _G
             if len(self.trail) >= 2:
                 path = QtGui.QPainterPath()
-                x0 = cx + self.trail[0][0] / span * radius
-                y0 = cy - self.trail[0][1] / span * radius
-                path.moveTo(x0, y0)
+                path.moveTo(cx + self.trail[0][0] / span * radius, cy - self.trail[0][1] / span * radius)
                 for lateral, longitudinal in self.trail[1:]:
                     path.lineTo(cx + lateral / span * radius, cy - longitudinal / span * radius)
-                painter.setPen(QtGui.QPen(colors["ink"], 1.2))
+                painter.setPen(QtGui.QPen(colors["ink"], max(1.0, min(2.0, dial / 96.0))))
                 painter.setBrush(QtCore.Qt.NoBrush)
                 painter.drawPath(path)
             if self.trail:
                 lateral, longitudinal = self.trail[-1]
-                x = cx + lateral / span * radius
-                y = cy - longitudinal / span * radius
                 painter.setPen(QtCore.Qt.NoPen)
                 painter.setBrush(colors["now"])
-                painter.drawEllipse(QtCore.QPointF(x, y), 4.0, 4.0)
+                painter.drawEllipse(
+                    QtCore.QPointF(cx + lateral / span * radius, cy - longitudinal / span * radius),
+                    min(6.0, max(3.0, 4.0 * dial / 96.0)),
+                    min(6.0, max(3.0, 4.0 * dial / 96.0)),
+                )
+            # A plate breaks the ring and the trail behind each number. The stroke used to run through the glyph.
+            drawn = []
+            for text, rect, faint in items:
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(colors["face"])
+                painter.drawRect(rect.adjusted(-1.0, 0.0, 1.0, 0.0))
+                painter.setPen(colors["faint"] if faint else colors["ink"])
+                drawn.append(_draw_centered(painter, font, text, rect.center().x(), rect.center().y()))
+            self.label_rects = drawn
 
     class ControlPlot(QtWidgets.QWidget):
         """One pane: speed, steer, and g-g, sharing a circle size."""
@@ -428,18 +626,16 @@ def _install() -> None:
             inner_h = self.height() - 2 * margin
             if inner_w < 48 or inner_h < 48:
                 return
-            side_m = 36
-            top_m = 18
 
             def largest(allow_wrap: bool) -> int:
                 found = 1
                 lo, hi = 1, max(1, min(inner_w, inner_h))
                 while lo <= hi:
                     mid = (lo + hi) // 2
-                    speed_cap, steer_cap = _caption_heights(mid)
+                    speed_w, speed_h, steer_w, steer_h, side_m, top_m = _gauge_chrome(mid)
                     sizes = (
-                        (max(mid, 72), mid + speed_cap),
-                        (max(mid, 72), mid + steer_cap),
+                        (max(mid, speed_w), mid + speed_h),
+                        (max(mid, steer_w), mid + steer_h),
                         (mid + 2 * side_m, mid + top_m),
                     )
                     used = column_h = column_w = 0
@@ -477,14 +673,14 @@ def _install() -> None:
                 return
             self.placed_size = size
             self.dial = wanted
-            speed_cap, steer_cap = _caption_heights(wanted)
+            speed_w, speed_h, steer_w, steer_h, side_m, top_m = _gauge_chrome(wanted)
             self.speed_gauge.dial_px = wanted
             self.steer_wheel.dial_px = wanted
-            gg_w, gg_h = wanted + 2 * side_m, wanted + top_m
+            self.gg.dial_px = wanted
             items = (
-                (self.speed_gauge, max(wanted, 72), wanted + speed_cap),
-                (self.steer_wheel, max(wanted, 72), wanted + steer_cap),
-                (self.gg, gg_w, gg_h),
+                (self.speed_gauge, max(wanted, speed_w), wanted + speed_h),
+                (self.steer_wheel, max(wanted, steer_w), wanted + steer_h),
+                (self.gg, wanted + 2 * side_m, wanted + top_m),
             )
             columns: list[list] = []
             column: list = []
