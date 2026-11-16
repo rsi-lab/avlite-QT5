@@ -58,17 +58,24 @@ class VisualizerQtWindow:
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.setSpacing(4)
 
+        from .control_plot import ControlPlot
         from .plot_widgets import GlobalPlotWidget, LocalPlotWidget
 
         self.plots_splitter = QtWidgets.QSplitter()
         self.plots_splitter.setChildrenCollapsible(False)
         self.local_plot = LocalPlotWidget(self)
         self.global_plot = GlobalPlotWidget(self)
+        self.control_plot = ControlPlot(self)
         self.plots_splitter.addWidget(self.local_plot)
         self.plots_splitter.addWidget(self.global_plot)
+        self.plots_splitter.addWidget(self.control_plot)
         self.plots_splitter.setStretchFactor(0, 1)
         self.plots_splitter.setStretchFactor(1, 1)
+        self.plots_splitter.setStretchFactor(2, 1)
         self.plots_splitter.setMinimumHeight(360)
+        self.plots_splitter.splitterMoved.connect(self._save_plot_sashes)
+        self.applied_cmd = None
+        self._sashes_ready = False
         root_layout.addWidget(self.plots_splitter, 1)
 
         from .config_bar import ConfigBar
@@ -156,6 +163,13 @@ class VisualizerQtWindow:
                 self.update_views(),
             )
         )
+        act_control = view_menu.addAction("Toggle control plot")
+        act_control.triggered.connect(
+            lambda: (
+                self.setting.p67_show_control_view.set(not self.setting.p67_show_control_view.get()),
+                self.update_views(),
+            )
+        )
         act_dark = view_menu.addAction("Toggle dark mode")
         act_dark.triggered.connect(self._toggle_dark)
 
@@ -195,6 +209,7 @@ class VisualizerQtWindow:
             self.win.setStyleSheet("")
         self.local_plot.update_theme(self.setting.p60_bg_color, self.setting.p60_fg_color)
         self.global_plot.update_theme(self.setting.p60_bg_color, self.setting.p60_fg_color)
+        self.control_plot.update_theme(self.setting.p60_bg_color, self.setting.p60_fg_color)
 
     def _open_profile_dialog(self) -> None:
         profiles = list_profiles(AppSettings) or ["default"]
@@ -209,6 +224,9 @@ class VisualizerQtWindow:
 
     def show(self) -> None:
         self.win.show()
+        self.app.processEvents()
+        self._apply_plot_sashes()
+        self._sashes_ready = True
 
     def exec_app(self) -> int:
         self.show()
@@ -297,7 +315,7 @@ class VisualizerQtWindow:
             self.reload_stack(reload_code=True)
             return True
         if text == "r":
-            self.stack_panels.planning._local_replan()
+            self.local_replan()
             return True
         if text == "T":
             self.config_bar.open_settings()
@@ -356,34 +374,28 @@ class VisualizerQtWindow:
             self.update_ui()
             return True
         if text == "w" and not self._drive_blocked("w"):
-            self.stack_panels.control._drive(3, 0)
+            self.drive(acceleration=3)
             return True
         if text == "s" and not self._drive_blocked("s"):
-            self.stack_panels.control._drive(-3, 0)
+            self.drive(acceleration=-3)
             return True
         if text == "a" and not self._drive_blocked("a"):
-            self.stack_panels.control._drive(0, 0.7)
+            self.drive(steer=0.7)
             return True
         if text == "d" and not self._drive_blocked("d"):
-            self.stack_panels.control._drive(0, -0.7)
+            self.drive(steer=-0.7)
             return True
         if text == "h":
-            self.stack_panels.control._step()
+            self.step_control()
             return True
         if text == "i":
-            self.stack_panels.control._align()
+            self.align_control()
             return True
-        if text == "n" and self.exec and self.exec.local_planner:
-            gt = self.exec.local_planner.global_trajectory
-            if hasattr(gt, "step_wp"):
-                gt.step_wp(1)
-            self.update_ui()
+        if text == "n":
+            self.step_plan()
             return True
-        if text == "b" and self.exec and self.exec.local_planner:
-            gt = self.exec.local_planner.global_trajectory
-            if hasattr(gt, "step_wp"):
-                gt.step_wp(-1)
-            self.update_ui()
+        if text == "b":
+            self.step_plan_back()
             return True
         return False
 
@@ -458,19 +470,13 @@ class VisualizerQtWindow:
             self.win.setFocus()
             return True
         if action == "replan":
-            self.stack_panels.planning._local_replan()
+            self.local_replan()
             return True
-        if action == "step_plan" and self.exec and self.exec.local_planner:
-            gt = self.exec.local_planner.global_trajectory
-            if hasattr(gt, "step_wp"):
-                gt.step_wp(1)
-            self.update_ui()
+        if action == "step_plan":
+            self.step_plan()
             return True
-        if action == "step_plan_back" and self.exec and self.exec.local_planner:
-            gt = self.exec.local_planner.global_trajectory
-            if hasattr(gt, "step_wp"):
-                gt.step_wp(-1)
-            self.update_ui()
+        if action == "step_plan_back":
+            self.step_plan_back()
             return True
         if action == "zoom_in":
             self.setting.p66_xy_zoom = max(5.0, float(self.setting.p66_xy_zoom) - 5.0)
@@ -522,29 +528,29 @@ class VisualizerQtWindow:
             self.log_panel.scroll_half_page(1)
             return True
         if action == "accelerate" and not self._drive_blocked("w"):
-            self.stack_panels.control._drive(3, 0)
+            self.drive(acceleration=3)
             return True
         if action == "decelerate" and not self._drive_blocked("s"):
-            self.stack_panels.control._drive(-3, 0)
+            self.drive(acceleration=-3)
             return True
         if action == "steer_left" and not self._drive_blocked("a"):
-            self.stack_panels.control._drive(0, 0.7)
+            self.drive(steer=0.7)
             return True
         if action == "steer_right" and not self._drive_blocked("d"):
-            self.stack_panels.control._drive(0, -0.7)
+            self.drive(steer=-0.7)
             return True
         if action == "step_control":
-            self.stack_panels.control._step()
+            self.step_control()
             return True
         if action == "align_control":
-            self.stack_panels.control._align()
+            self.align_control()
             return True
         return False
 
     def _on_key_release(self, event) -> bool:
         text = event.text()
         if text in ("a", "d") and not self._typing_focus() and not self._drive_blocked(text):
-            self.stack_panels.control._drive(0, 0)
+            self.drive(steer=0)
             return True
         return False
 
@@ -577,14 +583,71 @@ class VisualizerQtWindow:
     def update_views(self) -> None:
         show_g = bool(self.setting.p67_global_plan_view.get())
         show_l = bool(self.setting.local_plan_view_enabled())
+        show_c = bool(self.setting.p67_show_control_view.get())
         self.global_plot.setVisible(show_g)
         self.local_plot.setVisible(show_l)
+        self.control_plot.setVisible(show_c)
         self.local_plot.update_visibility()
+        self._apply_plot_sashes()
         hide_menu = bool(getattr(self.setting.schema, "p60_hide_menubar", False))
         self.win.menuBar().setVisible(not hide_menu)
         if hasattr(self, "config_bar"):
             self.config_bar.sync_from_settings()
         self.update_shortcut_mode()
+
+    def _plot_children(self) -> list:
+        return [self.local_plot, self.global_plot, self.control_plot]
+
+    def _save_plot_sashes(self, *_args) -> None:
+        if not self._sashes_ready or not self.win.isVisible():
+            return
+        visible = [
+            (child, size)
+            for child, size in zip(self._plot_children(), self.plots_splitter.sizes())
+            if child.isVisible() and size > 0
+        ]
+        if not 2 <= len(visible) <= 4:
+            return
+        total = sum(size for _child, size in visible)
+        if total <= 1:
+            return
+        self.setting.p67_plot_sashes = {
+            type(child).__name__: round(size / total, 4) for child, size in visible
+        }
+
+    def _apply_plot_sashes(self) -> None:
+        children = self._plot_children()
+        visible = [child for child in children if child.isVisible()]
+        names = [type(child).__name__ for child in visible]
+        saved = dict(self.setting.p67_plot_sashes or {})
+        total = sum(self.plots_splitter.sizes())
+        if total <= 1 or not names:
+            return
+        matched = (
+            2 <= len(names) <= 4
+            and set(saved) == set(names)
+            and all(float(saved[name]) > 0 for name in names)
+        )
+        if matched:
+            sizes = [
+                0 if not child.isVisible() else max(1, int(round(float(saved[type(child).__name__]) * total)))
+                for child in children
+            ]
+        elif len(names) >= 2:
+            share, extra = divmod(total, len(names))
+            sizes = []
+            for child in children:
+                if not child.isVisible():
+                    sizes.append(0)
+                    continue
+                sizes.append(share + extra)
+                extra = 0
+        else:
+            return
+        if sizes != list(self.plots_splitter.sizes()):
+            self.plots_splitter.blockSignals(True)
+            self.plots_splitter.setSizes(sizes)
+            self.plots_splitter.blockSignals(False)
 
     def local_plan_view_enabled(self) -> bool:
         return self.setting.local_plan_view_enabled()
@@ -614,6 +677,8 @@ class VisualizerQtWindow:
                 latency += self.global_plot.redraw()
             if self.setting.local_plan_view_enabled():
                 latency += self.local_plot.redraw()
+            if self.setting.p67_show_control_view.get() and self.control_plot.isVisible():
+                latency += self.control_plot.redraw()
             self._last_plot_t = t0
             self.setting.plot_latency_ms.set(f"{latency:7.1f}")
 
@@ -691,6 +756,9 @@ class VisualizerQtWindow:
     def apply_world_control(self, cmd, dt) -> None:
         self.exec.world.control_ego_state(cmd=cmd, dt=dt)
         self.exec.pm.ego_vehicle.copy_from(self.exec.world.get_ego_state())
+        self.applied_cmd = cmd
+        if self.exec.controller is not None:
+            self.exec.controller.cmd = cmd
 
     def spawn_agent(self, agent_state: AgentState) -> None:
         if self.exec is None:
@@ -712,12 +780,12 @@ class VisualizerQtWindow:
             self.setting.c60_selected_profile.set(profile)
         else:
             profile = self.setting.c60_selected_profile.get()
+        previous = self.loaded_profile
         load_setting(AppSettings, profile=profile)
         self._pin_self_as_community_plugin()
         self.setting.sync_app_from_singleton()
         if not only_stack:
             load_setting(self.setting.schema, profile=profile)
-            # Push plugin schema defaults into runtime vars where applicable
             from .settings import PluginSettings
 
             self.setting.p60_dark_mode.set(bool(PluginSettings.p60_dark_mode))
@@ -735,6 +803,16 @@ class VisualizerQtWindow:
         if hasattr(self, "config_bar"):
             self.config_bar.sync_from_settings()
         log.info("Loaded settings from profile: %s", profile)
+        if previous is not None and previous != profile:
+            self.show_profile_note()
+
+    def show_profile_note(self) -> None:
+        note = str(AppSettings.c60_profile_note or "").strip()
+        if not note:
+            return
+        self.QtWidgets.QMessageBox.information(
+            self.win, str(self.setting.c60_selected_profile.get() or ""), note,
+        )
 
     def refresh_pipeline(self) -> None:
         if self.exec is None:
@@ -784,6 +862,7 @@ class VisualizerQtWindow:
         finally:
             self.local_plot.reset()
             self.global_plot.reset()
+            self.control_plot.reset()
             self.stack_panels.refresh()
             self.update_views()
             if self.exec is not None:

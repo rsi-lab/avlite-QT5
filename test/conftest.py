@@ -16,6 +16,10 @@ PLUGIN_NAME = "avlite-QT5"
 
 
 def ensure_plugin_loaded() -> None:
+    # Community import attaches this checkout's parent to ``avlite.plugins``.
+    # The builtin package has to be on that path first, which ``avlite qt5``
+    # does while bootstrapping built-in apps.
+    import avlite.plugins  # noqa: F401
     from avlite.c60_apps.c63_plugins import import_plugin_modules
 
     import_plugin_modules(str(PLUGIN_DIR), pkg_name=PLUGIN_NAME)

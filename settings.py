@@ -57,7 +57,12 @@ class PluginSettingsSchema(SettingsSchema):
         default=True, description="Show perception extras (clusters, occupancy, predictions)."
     )
     p67_global_plan_view: bool = Field(default=True, description="Show global plan panel.")
+    p67_show_control_view: bool = Field(default=True, description="Show the control plot.")
     p67_local_plan_view: bool = Field(default=True, description="Show local plan panel.")
+    p67_plot_sashes: dict[str, float] = Field(
+        default_factory=dict,
+        description="Width fraction of each visible plot pane. Stored for at most 4 panes.",
+    )
     p67_perception_folded: bool = Field(default=False, description="Fold the Perception panel to its title.")
     p67_plan_folded: bool = Field(default=False, description="Fold the Planning panel to its title.")
     p67_control_folded: bool = Field(default=False, description="Fold the Control panel to its title.")

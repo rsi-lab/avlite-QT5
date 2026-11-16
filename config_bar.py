@@ -49,8 +49,10 @@ def _install() -> None:
             self.chk_global = self._check("Global", "chkGlobal")
             self.chk_frenet = self._check("Local Frenet", "chkLocalFrenet")
             self.chk_local = self._check("Local Global", "chkLocalGlobal")
+            self.chk_control = self._check("Control", "chkControl")
             for box in (
-                self.chk_shortcuts, self.chk_dark, self.chk_global, self.chk_frenet, self.chk_local,
+                self.chk_shortcuts, self.chk_dark, self.chk_global, self.chk_frenet,
+                self.chk_local, self.chk_control,
             ):
                 row.addWidget(box)
             self.chk_shortcuts.stateChanged.connect(self._on_shortcuts)
@@ -58,6 +60,7 @@ def _install() -> None:
             self.chk_global.stateChanged.connect(self._on_global)
             self.chk_frenet.stateChanged.connect(self._on_frenet)
             self.chk_local.stateChanged.connect(self._on_local)
+            self.chk_control.stateChanged.connect(self._on_control)
 
             self.status = QtWidgets.QLabel("Click plot")
             self.status.setObjectName("plotStatus")
@@ -152,6 +155,7 @@ def _install() -> None:
                 self.chk_global.setChecked(bool(s.p67_global_plan_view.get()))
                 self.chk_frenet.setChecked(bool(s.p67_show_local_frenet_view.get()))
                 self.chk_local.setChecked(bool(s.p67_show_local_global_view.get()))
+                self.chk_control.setChecked(bool(s.p67_show_control_view.get()))
                 profiles = list(getattr(s, "profile_list", None) or []) or list_profiles(AppSettings) or ["default"]
                 current = str(s.c60_selected_profile.get() or "default")
                 self.profile.blockSignals(True)
@@ -195,6 +199,12 @@ def _install() -> None:
             if self._syncing:
                 return
             self.root.setting.p67_show_local_global_view.set(self._checked(state))
+            self.root.update_views()
+
+        def _on_control(self, state: int) -> None:
+            if self._syncing:
+                return
+            self.root.setting.p67_show_control_view.set(self._checked(state))
             self.root.update_views()
 
         def _on_profile(self, name: str) -> None:

@@ -134,8 +134,7 @@ def test_settings_dialog_fits_and_actions(window, qapp):
         table.item(other, 3).setText(previous)
 
         calls = []
-        planning = window.stack_panels.planning
-        planning._local_replan = lambda: calls.append("replan")
+        window.local_replan = lambda: calls.append("replan")
         dlg.tabs.setFocus()
         qapp.processEvents()
         _press(qapp, window, "r", QtCore.Qt.Key_R)

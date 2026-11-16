@@ -101,7 +101,9 @@ class VisualizationSettings:
         self.p67_show_occupancy_map = Var(bool(PluginSettings.p67_show_occupancy_map))
         self.p67_show_prediction = Var(bool(PluginSettings.p67_show_prediction))
         self.p67_global_plan_view = Var(bool(PluginSettings.p67_global_plan_view))
+        self.p67_show_control_view = Var(bool(PluginSettings.p67_show_control_view))
         self.p67_local_plan_view = Var(bool(PluginSettings.p67_local_plan_view))
+        self.p67_plot_sashes = dict(PluginSettings.p67_plot_sashes or {})
         self.p67_perception_folded = Var(bool(PluginSettings.p67_perception_folded))
         self.p67_plan_folded = Var(bool(PluginSettings.p67_plan_folded))
         self.p67_control_folded = Var(bool(PluginSettings.p67_control_folded))
@@ -288,6 +290,8 @@ class VisualizationSettings:
             current = getattr(self, name, None)
             if isinstance(current, Var):
                 current.set(value)
+            elif isinstance(current, dict) and isinstance(value, dict):
+                setattr(self, name, dict(value))
             elif current is not None and not callable(current):
                 setattr(self, name, value)
 
@@ -309,8 +313,12 @@ class VisualizationSettings:
         schema.p66_frenet_zoom = float(self.p66_frenet_zoom)
         schema.p66_global_zoom = float(self.p66_global_zoom)
         schema.p67_global_plan_view = bool(self.p67_global_plan_view.get())
+        schema.p67_show_control_view = bool(self.p67_show_control_view.get())
         schema.p67_show_local_global_view = bool(self.p67_show_local_global_view.get())
         schema.p67_show_local_frenet_view = bool(self.p67_show_local_frenet_view.get())
+        schema.p67_plot_sashes = {
+            str(name): float(fraction) for name, fraction in dict(self.p67_plot_sashes or {}).items()
+        }
         schema.p68_show_core_logs = bool(self.p68_show_core_logs.get())
         schema.p68_show_plugins_logs = bool(self.p68_show_plugins_logs.get())
         schema.p68_show_perceive_logs = bool(self.p68_show_perceive_logs.get())

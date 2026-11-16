@@ -101,7 +101,7 @@ def test_capability_checks_filter_world_sensors(window):
 
 
 def test_control_readouts_keep_their_instruments(window, qapp):
-    """CTE bars sit on their numbers. Steer is a wheel and speed is a dial."""
+    """CTE bars sit on their numbers. Speed and steer live on the control plot."""
     window._ui_timer.stop()
     window.show()
     qapp.processEvents()
@@ -126,22 +126,23 @@ def test_control_readouts_keep_their_instruments(window, qapp):
         assert 0 <= bar_box.top() - label_box.bottom() <= 8, (label_name, label_box, bar_box)
         assert bar_box.width() >= label_box.width(), (label_name, label_box, bar_box)
 
-    for label_name, instrument_name in (("accel", "speedGauge"), ("steer", "steerWheel")):
-        label_box, inst_box = _placed(label_name, instrument_name)
-        assert 0 <= inst_box.top() - label_box.bottom() <= 8, (label_name, label_box, inst_box)
-        assert inst_box.left() <= label_box.right() and inst_box.right() >= label_box.left()
-
+    assert control.findChild(window.QtWidgets.QWidget, "speedGauge") is None
+    assert control.findChild(window.QtWidgets.QWidget, "steerWheel") is None
     assert window.win.findChild(window.QtWidgets.QWidget, "valueGauge_steer") is None
     assert window.win.findChild(window.QtWidgets.QWidget, "valueGauge_accel") is None
-    window.setting.cmd_steer.set(0.35)
-    assert window.win.findChild(window.QtWidgets.QWidget, "steerWheel")._steer == 0.35
+    window.drive(steer=0.35)
+    wheel = window.control_plot.steer_wheel
+    dial = window.control_plot.speed_gauge
+    assert wheel.steer == 0.35
     window.exec.ego_state.velocity = 12.5
-    window.setting.vehicle_state.set("speed-check")
-    dial = window.win.findChild(window.QtWidgets.QWidget, "speedGauge")
-    assert dial._speed == 12.5
-    assert dial.caption() == "45.0 km/h (12.5 m/s)"
+    window.update_ui()
+    assert dial.speed == 12.5
+    assert dial.caption() == "45.0 km/h"
+    assert dial.caption_mps() == "12.5 m/s"
     assert "Accel" in control.gauges["accel"].text()
     assert "Steer" in control.gauges["steer"].text()
+    assert window.control_plot.speed_gauge.isVisible()
+    assert window.control_plot.steer_wheel.isVisible()
 
 
 def test_schema_settings_and_plugin_browser_build(window, qapp):

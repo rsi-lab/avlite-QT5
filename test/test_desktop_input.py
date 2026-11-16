@@ -49,7 +49,7 @@ def test_config_bar_and_log_are_visible(window, qapp):
     assert bar.isVisible()
     assert bar.height() > 20
     for name in (
-        "chkShortcuts", "chkDark", "chkGlobal", "chkLocalFrenet", "chkLocalGlobal",
+        "chkShortcuts", "chkDark", "chkGlobal", "chkLocalFrenet", "chkLocalGlobal", "chkControl",
         "profileCombo", "btnSaveSettings", "btnResetSettings", "btnReloadStack",
         "btnPlugins", "btnSettings", "plotStatus",
     ):

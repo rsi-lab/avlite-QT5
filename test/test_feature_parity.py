@@ -248,8 +248,13 @@ def test_view_toggles(window):
     assert window.local_plot.frenet_plot.isHidden()
     window.setting.p67_global_plan_view.set(True)
     window.setting.p67_show_local_frenet_view.set(True)
+    window.setting.p67_show_control_view.set(False)
     window.update_views()
     assert not window.global_plot.isHidden()
+    assert window.control_plot.isHidden()
+    window.setting.p67_show_control_view.set(True)
+    window.update_views()
+    assert not window.control_plot.isHidden()
 
 
 @pytest.mark.requires_data
