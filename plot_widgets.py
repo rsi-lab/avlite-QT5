@@ -20,6 +20,19 @@ log = logging.getLogger(__name__)
 
 
 
+def _curve_bodies(ego_curve, agent_curves) -> list:
+    """Closed footprints for the ego, then each agent, in Tk's patch colors."""
+    bodies = []
+    xs, ys = ego_curve.getData()
+    if xs is not None and len(xs) >= 3:
+        bodies.append((np.column_stack((xs, ys)), _EGO_FILL))
+    for curve in agent_curves:
+        xs, ys = curve.getData()
+        if xs is not None and len(xs) >= 3:
+            bodies.append((np.column_stack((xs, ys)), _AGENT_FILL))
+    return bodies
+
+
 def _closed_poly(corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if corners is None or len(corners) == 0:
         return np.array([]), np.array([])
@@ -181,6 +194,12 @@ _BEHIND_RGB = (147, 112, 219)
 _ELLIPSE_PERCENTILES = (0.5, 0.95)
 _ELLIPSE_STRIDE_S = 0.5
 _ELLIPSE_SAMPLES = 24
+# Tk's vehicle patches: azure fill, red ego edge, darkblue agent edge.
+# The alpha is the patch alpha, so the fill stays light on a #333333 plot.
+_EGO_FILL = (240, 255, 255, 178)
+_AGENT_FILL = (240, 255, 255, 153)
+_EGO_EDGE = (255, 0, 0, 178)
+_AGENT_EDGE = (0, 0, 139, 153)
 
 
 def _ellipse_steps(n_steps: int, dt: float, stride_s: float = _ELLIPSE_STRIDE_S) -> list[int]:
@@ -709,7 +728,10 @@ def _install_widgets() -> None:
             self.update()
 
         def paint(self, painter, *args) -> None:
-            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            # Smoothing spreads a translucent stroke across neighboring pixels,
+            # so a light mode and a 50% ring come out grayer than the same rgba
+            # in Tk. A hard stroke keeps the alpha Tk blended onto #333333.
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
             painter.setBrush(QtCore.Qt.NoBrush)
             for poly, color, width in self._polys:
                 red, green, blue, alpha = color
@@ -721,6 +743,65 @@ def _install_widgets() -> None:
 
         def boundingRect(self):
             return self._bounds
+
+    class _BodyLayer(pg.GraphicsObject):
+        """Filled vehicle footprints. The outline curves stay separate."""
+
+        def __init__(self):
+            super().__init__()
+            self.bodies: list = []
+            self._polys: list = []
+            self._bounds = QtCore.QRectF()
+
+        def clear(self) -> None:
+            self.set_bodies([])
+
+        def set_bodies(self, bodies) -> None:
+            self.prepareGeometryChange()
+            self.bodies = list(bodies)
+            polys = []
+            xs: list[np.ndarray] = []
+            ys: list[np.ndarray] = []
+            for pts, color in self.bodies:
+                arr = np.asarray(pts, dtype=float)
+                if arr.ndim != 2 or len(arr) < 3:
+                    continue
+                poly = QtGui.QPolygonF(
+                    [QtCore.QPointF(float(x), float(y)) for x, y in arr[:, :2]]
+                )
+                polys.append((poly, color))
+                xs.append(arr[:, 0])
+                ys.append(arr[:, 1])
+            self._polys = polys
+            if xs:
+                x = np.concatenate(xs)
+                y = np.concatenate(ys)
+                self._bounds = QtCore.QRectF(
+                    float(x.min()), float(y.min()),
+                    float(x.max() - x.min()) or 1.0,
+                    float(y.max() - y.min()) or 1.0,
+                )
+            else:
+                self._bounds = QtCore.QRectF()
+            self.update()
+
+        def paint(self, painter, *args) -> None:
+            painter.setPen(QtCore.Qt.NoPen)
+            for poly, color in self._polys:
+                red, green, blue, alpha = color
+                painter.setBrush(QtGui.QColor(int(red), int(green), int(blue), int(alpha)))
+                painter.drawPolygon(poly)
+
+        def boundingRect(self):
+            return self._bounds
+
+    def _theme_plot(plot, bg: str, fg: str) -> None:
+        """Match Tk: plot face, axis line, tick text, and axis title use the theme."""
+        plot.setBackground(bg)
+        for side in ("bottom", "left"):
+            axis = plot.getAxis(side)
+            axis.setPen(fg)
+            axis.setTextPen(fg)
 
     class GlobalPlotWidget(pg.PlotWidget):
         """Global map / raceline / HD-map overview with ego marker."""
@@ -826,9 +907,7 @@ def _install_widgets() -> None:
                 curve.setData([], [])
 
         def update_theme(self, bg: str, fg: str) -> None:
-            self.setBackground(bg)
-            self.getAxis("bottom").setPen(fg)
-            self.getAxis("left").setPen(fg)
+            _theme_plot(self, bg, fg)
 
         def _ctrl(self, modifiers) -> bool:
             return bool(modifiers & QtCore.Qt.ControlModifier)
@@ -1270,7 +1349,8 @@ def _install_widgets() -> None:
             ):
                 pw.setLabel("bottom", xlabel)
                 pw.setLabel("left", ylabel)
-                pw.showGrid(x=True, y=True, alpha=0.25)
+                # Tk leaves these axes clear. A grid cuts through the
+                # translucent forecast rings on the dark plot.
                 _pin_plot_chrome(pw)
             layout.addWidget(self.xy_plot, 1)
             layout.addWidget(self.frenet_plot, 1)
@@ -1281,6 +1361,9 @@ def _install_widgets() -> None:
             )
             self.legend.setObjectName("plotLegend")
             self.legend.setWordWrap(True)
+            self.legend.setStyleSheet(
+                f"color: {root.setting.p60_fg_color}; background: {root.setting.p60_bg_color};"
+            )
             layout.addWidget(self.legend)
 
             self._init_curves()
@@ -1312,9 +1395,14 @@ def _install_widgets() -> None:
             self.xy_right = self.xy_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=2), connect="finite")
             self.xy_ref = self.xy_plot.plotItem.plot(pen=pg.mkPen("#888888", width=2), connect="finite")
             self.xy_local = self.xy_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
-            self.xy_ego = self.xy_plot.plotItem.plot(pen=pg.mkPen("r", width=2))
+            ego_pen = pg.mkPen(QtGui.QColor(*_EGO_EDGE), width=1.5)
+            agent_pen = pg.mkPen(QtGui.QColor(*_AGENT_EDGE), width=1.0)
+            self.xy_bodies = _BodyLayer()
+            self.xy_bodies.setZValue(-1)
+            self.xy_plot.addItem(self.xy_bodies)
+            self.xy_ego = self.xy_plot.plotItem.plot(pen=ego_pen)
             self.xy_agents = [
-                self.xy_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
+                self.xy_plot.plotItem.plot(pen=agent_pen) for _ in range(12)
             ]
             self.xy_lidar = pg.ScatterPlotItem(size=5, brush=pg.mkBrush(50, 255, 50, 200), pen=None)
             self.xy_plot.addItem(self.xy_lidar)
@@ -1362,9 +1450,12 @@ def _install_widgets() -> None:
             self.sd_right = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#d2b48c", width=1), connect="finite")
             self.sd_ref = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#888888", width=1), connect="finite")
             self.sd_local = self.frenet_plot.plotItem.plot(pen=pg.mkPen("#ef5350", width=3), connect="finite")
-            self.sd_ego = self.frenet_plot.plotItem.plot(pen=pg.mkPen("r", width=2))
+            self.sd_bodies = _BodyLayer()
+            self.sd_bodies.setZValue(-1)
+            self.frenet_plot.addItem(self.sd_bodies)
+            self.sd_ego = self.frenet_plot.plotItem.plot(pen=ego_pen)
             self.sd_agents = [
-                self.frenet_plot.plotItem.plot(pen=pg.mkPen("#1565c0", width=1.5)) for _ in range(12)
+                self.frenet_plot.plotItem.plot(pen=agent_pen) for _ in range(12)
             ]
             self.sd_pred = _ForecastLayer()
             self.sd_pred.setZValue(8)
@@ -1421,6 +1512,8 @@ def _install_widgets() -> None:
                 curve.setData([], [])
             for c in self.xy_agents + self.sd_agents:
                 c.setData([], [])
+            self.xy_bodies.clear()
+            self.sd_bodies.clear()
             self.xy_pred.clear()
             self.sd_pred.clear()
             self.xy_lidar.setData([], [])
@@ -1442,9 +1535,8 @@ def _install_widgets() -> None:
 
         def update_theme(self, bg: str, fg: str) -> None:
             for pw in (self.xy_plot, self.frenet_plot):
-                pw.setBackground(bg)
-                pw.getAxis("bottom").setPen(fg)
-                pw.getAxis("left").setPen(fg)
+                _theme_plot(pw, bg, fg)
+            self.legend.setStyleSheet(f"color: {fg}; background: {bg};")
 
         def update_visibility(self) -> None:
             s = self.root.setting
@@ -1930,13 +2022,16 @@ def _install_widgets() -> None:
                 self.xy_heading.setData([], [])
                 for curve in self.xy_agents + self.sd_agents:
                     curve.setData([], [])
+                self.xy_bodies.clear()
+                self.sd_bodies.clear()
                 return
             self._curve_cache["ego_off"] = False
             pose = (
                 round(float(ego.x), 3), round(float(ego.y), 3), round(float(ego.theta), 4),
                 self._xy_on, self._frenet_on, id(gt) if gt is not None else 0,
             )
-            if self._curve_cache.get("ego_pose") != pose:
+            pose_changed = self._curve_cache.get("ego_pose") != pose
+            if pose_changed:
                 self._curve_cache["ego_pose"] = pose
                 if self._xy_on:
                     self.xy_ego.setData(*_closed_poly(ego.get_bb_corners()))
@@ -1971,23 +2066,29 @@ def _install_widgets() -> None:
                     for a in agents
                 ),
             )
-            if self._curve_cache.get("agents") == atoken:
-                return
-            self._curve_cache["agents"] = atoken
-            for i, curve in enumerate(self.xy_agents):
-                if self._xy_on and i < len(agents):
-                    curve.setData(*_closed_poly(agents[i].get_bb_corners()))
-                else:
-                    curve.setData([], [])
-            for i, curve in enumerate(self.sd_agents):
-                if self._frenet_on and gt is not None and i < len(agents):
-                    try:
-                        sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
-                        curve.setData(*_closed_poly(sd_c))
-                    except Exception:
+            agents_changed = self._curve_cache.get("agents") != atoken
+            if agents_changed:
+                self._curve_cache["agents"] = atoken
+                for i, curve in enumerate(self.xy_agents):
+                    if self._xy_on and i < len(agents):
+                        curve.setData(*_closed_poly(agents[i].get_bb_corners()))
+                    else:
                         curve.setData([], [])
-                else:
-                    curve.setData([], [])
+                for i, curve in enumerate(self.sd_agents):
+                    if self._frenet_on and gt is not None and i < len(agents):
+                        try:
+                            sd_c = gt.convert_xy_path_to_sd_path_np(agents[i].get_bb_corners())
+                            curve.setData(*_closed_poly(sd_c))
+                        except Exception:
+                            curve.setData([], [])
+                    else:
+                        curve.setData([], [])
+            if pose_changed or agents_changed:
+                self._sync_vehicle_bodies()
+
+        def _sync_vehicle_bodies(self) -> None:
+            self.xy_bodies.set_bodies(_curve_bodies(self.xy_ego, self.xy_agents))
+            self.sd_bodies.set_bodies(_curve_bodies(self.sd_ego, self.sd_agents))
 
         def _lidar_allowed(self, stack) -> bool:
             try:

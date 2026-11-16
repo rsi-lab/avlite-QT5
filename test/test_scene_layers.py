@@ -182,6 +182,50 @@ def test_gmm_and_gp_prediction_geometry():
     assert lines[0][1][:3] == (147, 112, 219)
 
 
+def test_forecast_alpha_stays_true_on_a_dark_plot(qapp):
+    """A translucent stroke must keep Tk's blend. Antialiasing washes it out."""
+    from PyQt5 import QtGui
+    from avlite.plugins.avlite_QT5.plot_widgets import LocalPlotWidget
+
+    class _Setting:
+        p60_bg_color = "#333333"
+        p60_fg_color = "white"
+
+    class _Root:
+        setting = _Setting()
+
+    widget = LocalPlotWidget(_Root())
+    widget.resize(480, 220)
+    widget.xy_plot.resize(480, 180)
+    widget.update_theme("#333333", "white")
+    widget.xy_pred.set_drawings(
+        [(np.column_stack((np.linspace(0.0, 20.0, 40), np.zeros(40))), (255, 140, 0, 0.25))],
+        [],
+    )
+    widget.xy_plot.setRange(xRange=(0, 20), yRange=(-4, 4), padding=0)
+    widget.show()
+    qapp.processEvents()
+    image = widget.xy_plot.grab().toImage().convertToFormat(QtGui.QImage.Format_RGB888)
+    ptr = image.bits()
+    ptr.setsize(image.byteCount())
+    raw = np.frombuffer(ptr, np.uint8).reshape(image.height(), image.bytesPerLine())
+    rgb = raw[:, : image.width() * 3].reshape(image.height(), image.width(), 3).astype(int)
+    # 0.25 * darkorange + 0.75 * #333333.
+    target = np.array([102, 73, 38])
+    close = np.abs(rgb - target).sum(axis=2) <= 18
+    assert int(close.sum()) > 20
+    text = widget.xy_plot.getAxis("bottom").textPen().color()
+    assert text.red() > 240 and text.green() > 240 and text.blue() > 240
+    assert "white" in widget.legend.styleSheet()
+    assert "#333333" in widget.legend.styleSheet()
+    widget.update_theme("white", "black")
+    text = widget.xy_plot.getAxis("left").textPen().color()
+    assert text.red() < 20 and text.green() < 20 and text.blue() < 20
+    assert "black" in widget.legend.styleSheet()
+    assert "white" in widget.legend.styleSheet().split("background")[-1]
+    widget.close()
+
+
 def test_constant_velocity_gmm_and_gp_paint(window):
     from avlite.c10_perception.c11_perception_model import AgentState
     from avlite.c10_perception.c15_perception_algs import ConstantVelocityGMM, ConstantVelocityGP

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 
-def attach_panel_fold(group, var, *, name: str) -> None:
+def attach_panel_fold(group, var, *, name: str, on_apply=None) -> None:
     """Fold *group* down to its title when *var* is true.
 
     The button sits on the title row and is not part of the layout, so an
     unfolded panel keeps the size it had before the button was added.
+    ``on_apply(folded)`` runs after the contents are shown or hidden, so a
+    panel can put back rows that should stay hidden while it is open.
     """
     from .qt_binding import import_qt
 
@@ -43,6 +45,8 @@ def attach_panel_fold(group, var, *, name: str) -> None:
             group.setMaximumHeight(max(24, group.fontMetrics().height() + 14))
         else:
             group.setMaximumHeight(16777215)
+        if on_apply is not None:
+            on_apply(folded)
         _place()
 
     class _FollowResize(QtCore.QObject):

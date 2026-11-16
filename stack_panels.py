@@ -153,6 +153,14 @@ def _install_panels() -> None:
 
     _PANELS_READY = True
 
+    def _named_row(grid, row: int, text: str, combo, object_name: str):
+        label = QtWidgets.QLabel(text)
+        label.setObjectName(object_name + "Label")
+        combo.setObjectName(object_name + "Combo")
+        grid.addWidget(label, row, 0)
+        grid.addWidget(combo, row, 1)
+        return label
+
     class StackPanels(QtWidgets.QWidget):
         def __init__(self, root: "VisualizerQtWindow"):
             super().__init__()
@@ -197,15 +205,15 @@ def _install_panels() -> None:
             from avlite.c10_perception.c12_perception_strategy import PerceptionStrategy
 
             grid.addWidget(_info_button(self, self.perc, PerceptionStrategy.registry), 0, 2)
-            grid.addWidget(QtWidgets.QLabel("Detect"), 1, 0)
             self.det = _combo(self, root.setting.detection_strategy_type, choices["detection"], root.refresh_pipeline)
-            grid.addWidget(self.det, 1, 1)
-            grid.addWidget(QtWidgets.QLabel("Track"), 2, 0)
             self.trk = _combo(self, root.setting.tracking_strategy_type, choices["tracking"], root.refresh_pipeline)
-            grid.addWidget(self.trk, 2, 1)
-            grid.addWidget(QtWidgets.QLabel("Predict"), 3, 0)
             self.prd = _combo(self, root.setting.prediction_strategy_type, choices["prediction"], root.refresh_pipeline)
-            grid.addWidget(self.prd, 3, 1)
+            self.lbl_detect = _named_row(grid, 1, "Detect", self.det, "detect")
+            self.lbl_track = _named_row(grid, 2, "Track", self.trk, "track")
+            self.lbl_predict = _named_row(grid, 3, "Predict", self.prd, "predict")
+            self._pipeline_rows = (
+                self.lbl_detect, self.det, self.lbl_track, self.trk, self.lbl_predict, self.prd,
+            )
             grid.addWidget(QtWidgets.QLabel("Map"), 4, 0)
             self.mapping = _combo(
                 self, root.setting.mapping_type, choices["mapping"],
@@ -225,12 +233,18 @@ def _install_panels() -> None:
             self.state_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             pin_fluid_readout(self.state_lbl)
             root.setting.vehicle_state.bind(lambda: self.state_lbl.setText(str(root.setting.vehicle_state.get())))
-            self._update_pipeline_enabled()
+            root.setting.perception_type.bind(self._update_pipeline_visibility)
+            self._update_pipeline_visibility()
 
-        def _update_pipeline_enabled(self) -> None:
-            pipe = self.root.setting.perception_type.get() == PerceptionPipeline.__name__
-            for w in (self.det, self.trk, self.prd):
-                w.setEnabled(pipe)
+        def _update_pipeline_visibility(self) -> None:
+            # Tk drops these rows unless the strategy is the pipeline. Leaving
+            # them disabled still looks like a choice. A folded panel has
+            # already hidden every row; showing them again would pop the fold.
+            if bool(self.root.setting.p67_perception_folded.get()):
+                return
+            show = self.root.setting.perception_type.get() == PerceptionPipeline.__name__
+            for widget in self._pipeline_rows:
+                widget.setVisible(show)
 
         def refresh(self) -> None:
             choices = self.root.setting.registry_choices()
@@ -245,7 +259,7 @@ def _install_panels() -> None:
                 idx = box.findText(cur)
                 box.setCurrentIndex(idx if idx >= 0 else 0)
                 box.blockSignals(False)
-            self._update_pipeline_enabled()
+            self._update_pipeline_visibility()
 
 
     class PlanningPanel(QtWidgets.QGroupBox):
@@ -286,15 +300,35 @@ def _install_panels() -> None:
                 b.clicked.connect(slot)
                 wp_row.addWidget(b)
             grid.addLayout(wp_row, 7, 0, 1, 3)
-            grid.addWidget(QtWidgets.QLabel("Behavior"), 2, 0)
-            self.beh = _combo(self, root.setting.behavioral_strategy_type, [""] + [], root.refresh_pipeline)
-            grid.addWidget(self.beh, 2, 1)
-            grid.addWidget(QtWidgets.QLabel("Path"), 3, 0)
-            self.path = _combo(self, root.setting.path_strategy_type, [""], root.refresh_pipeline)
-            grid.addWidget(self.path, 3, 1)
-            grid.addWidget(QtWidgets.QLabel("Speed"), 4, 0)
-            self.vel = _combo(self, root.setting.velocity_strategy_type, [""], root.refresh_pipeline)
-            grid.addWidget(self.vel, 4, 1)
+            from avlite.c20_planning.c23_local_planning_strategy import (
+                LocalBehavioralPlanningStrategy,
+                LocalPathPlanningStrategy,
+                LocalVelocityPlanningStrategy,
+            )
+
+            # Seed the real names. A placeholder list makes the combo fall back
+            # to a blank row, and refresh() then keeps that blank text.
+            self.beh = _combo(
+                self, root.setting.behavioral_strategy_type,
+                [""] + list(LocalBehavioralPlanningStrategy.registry.keys()),
+                root.refresh_pipeline,
+            )
+            self.path = _combo(
+                self, root.setting.path_strategy_type,
+                [""] + list(LocalPathPlanningStrategy.registry.keys()),
+                root.refresh_pipeline,
+            )
+            self.vel = _combo(
+                self, root.setting.velocity_strategy_type,
+                [""] + list(LocalVelocityPlanningStrategy.registry.keys()),
+                root.refresh_pipeline,
+            )
+            self.lbl_behavior = _named_row(grid, 2, "Behavior", self.beh, "behavior")
+            self.lbl_path = _named_row(grid, 3, "Path", self.path, "path")
+            self.lbl_speed = _named_row(grid, 4, "Speed", self.vel, "speed")
+            self._pipeline_rows = (
+                self.lbl_behavior, self.beh, self.lbl_path, self.path, self.lbl_speed, self.vel,
+            )
             self.prob = _check(self, "Probabilistic collision", root.setting.probabilistic_collision_checking)
             grid.addWidget(self.prob, 5, 0, 1, 2)
             save_occ = QtWidgets.QPushButton("Save occupancy")
@@ -306,7 +340,15 @@ def _install_panels() -> None:
             grid.addWidget(self.wp_lbl, 6, 0, 1, 3)
             root.setting.current_wp.bind(self._update_wp)
             root.setting.lap.bind(self._update_wp)
+            root.setting.local_planner_type.bind(self._update_pipeline_visibility)
             self.refresh()
+
+        def _update_pipeline_visibility(self) -> None:
+            if bool(self.root.setting.p67_plan_folded.get()):
+                return
+            show = self.root.setting.local_planner_type.get() == LocalPlanningPipeline.__name__
+            for widget in self._pipeline_rows:
+                widget.setVisible(show)
 
         def _update_wp(self) -> None:
             wp = str(self.root.setting.current_wp.get()).strip()
@@ -335,9 +377,7 @@ def _install_panels() -> None:
                 idx = box.findText(cur)
                 box.setCurrentIndex(idx if idx >= 0 else 0)
                 box.blockSignals(False)
-            pipe = self.root.setting.local_planner_type.get() == LocalPlanningPipeline.__name__
-            for w in (self.beh, self.path, self.vel):
-                w.setEnabled(pipe)
+            self._update_pipeline_visibility()
 
 
     def _meter_palette(widget) -> dict:

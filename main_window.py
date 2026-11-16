@@ -128,8 +128,14 @@ class VisualizerQtWindow:
         panels = self.stack_panels
         attach_panel_fold(self.config_bar, setting.p60_settings_folded, name="foldSettings")
         attach_panel_fold(self.shortcut_help, setting.p60_shortcuts_folded, name="foldShortcuts")
-        attach_panel_fold(panels.perception, setting.p67_perception_folded, name="foldPerception")
-        attach_panel_fold(panels.planning, setting.p67_plan_folded, name="foldPlanning")
+        attach_panel_fold(
+            panels.perception, setting.p67_perception_folded, name="foldPerception",
+            on_apply=lambda folded: None if folded else panels.perception._update_pipeline_visibility(),
+        )
+        attach_panel_fold(
+            panels.planning, setting.p67_plan_folded, name="foldPlanning",
+            on_apply=lambda folded: None if folded else panels.planning._update_pipeline_visibility(),
+        )
         attach_panel_fold(panels.control, setting.p67_control_folded, name="foldControl")
         attach_panel_fold(panels.execution, setting.p67_execution_folded, name="foldExecution")
         attach_panel_fold(self.log_panel, setting.p68_log_folded, name="foldLog")

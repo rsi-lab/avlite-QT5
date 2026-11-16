@@ -133,3 +133,64 @@ def test_gauge_labels_stay_clear_as_the_pane_changes(qapp):
             assert len(dial.label_rects) >= 9
             assert len(wheel.label_rects) >= 4
             assert len(plot.gg.label_rects) >= 6
+
+
+@pytest.mark.requires_data
+def test_pipeline_sub_strategies_follow_the_selected_strategy(window, qapp, monkeypatch):
+    """Detect/Track/Predict and Behavior/Path/Speed appear only for their pipeline."""
+    errors = []
+    monkeypatch.setattr(
+        window.QtWidgets.QMessageBox, "critical", lambda *args, **kwargs: errors.append(args),
+    )
+    window._ui_timer.stop()
+    window.show()
+    qapp.processEvents()
+    perc = window.stack_panels.perception
+    plan = window.stack_panels.planning
+
+    assert perc.perc.currentText() == "PerceptionPipeline"
+    assert not perc.det.isHidden() and not perc.lbl_predict.isHidden()
+    assert plan.lplan.currentText() != "LocalPlanningPipeline"
+    assert plan.beh.isHidden() and plan.lbl_behavior.isHidden()
+    assert plan.path.isHidden() and plan.vel.isHidden()
+    assert perc.mapping.geometry().top() > perc.prd.geometry().bottom()
+    # Unfolding shows every row, then the pipeline rule hides its own again.
+    window.setting.p67_plan_folded.set(True)
+    qapp.processEvents()
+    window.setting.p67_plan_folded.set(False)
+    qapp.processEvents()
+    assert plan.beh.isHidden() and not plan.lplan.isHidden()
+    window.setting.p67_perception_folded.set(True)
+    qapp.processEvents()
+    window.setting.p67_perception_folded.set(False)
+    qapp.processEvents()
+    assert not perc.det.isHidden() and not perc.lbl_predict.isHidden()
+
+    window.setting.perception_type.set("")
+    qapp.processEvents()
+    assert perc.perc.currentText() == ""
+    assert perc.det.isHidden() and perc.trk.isHidden() and perc.prd.isHidden()
+    assert perc.lbl_detect.isHidden() and perc.lbl_track.isHidden() and perc.lbl_predict.isHidden()
+    assert not perc.mapping.isHidden() and not perc.loc.isHidden()
+    # The hidden rows give their space back, the way Tk's grid_remove does.
+    assert perc.mapping.geometry().top() - perc.perc.geometry().bottom() < 36
+
+    window.setting.perception_type.set("PerceptionPipeline")
+    qapp.processEvents()
+    assert not perc.det.isHidden() and not perc.prd.isHidden()
+
+    original_local = plan.lplan.currentText()
+    plan.lplan.setCurrentText("LocalPlanningPipeline")
+    qapp.processEvents()
+    assert plan.lplan.currentText() == "LocalPlanningPipeline"
+    assert not plan.beh.isHidden() and not plan.lbl_behavior.isHidden()
+    assert not plan.path.isHidden() and not plan.lbl_path.isHidden()
+    assert not plan.vel.isHidden() and not plan.lbl_speed.isHidden()
+    assert plan.prob.geometry().top() > plan.vel.geometry().bottom()
+    assert not perc.det.isHidden()
+
+    plan.lplan.setCurrentText(original_local)
+    qapp.processEvents()
+    assert errors == []
+    assert plan.beh.isHidden() and plan.path.isHidden() and plan.vel.isHidden()
+    assert plan.prob.geometry().top() - plan.lplan.geometry().bottom() < 36

@@ -58,6 +58,9 @@ def test_local_ego_box(window):
     window.update_ui()
     xs, ys = window.local_plot.xy_ego.getData()
     assert len(xs) >= 4 and len(ys) >= 4
+    # Tk fills the ego with azure. A dark-blue outline alone disappears on #333333.
+    assert window.local_plot.xy_bodies.bodies
+    assert window.local_plot.xy_bodies.bodies[0][1][:3] == (240, 255, 255)
 
 
 @pytest.mark.requires_data
