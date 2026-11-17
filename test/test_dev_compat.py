@@ -145,6 +145,46 @@ def test_gauge_labels_stay_clear_as_the_pane_changes(qapp):
             assert len(plot.gg.label_rects) >= 6
 
 
+def test_gg_marker_paints_over_a_label(qapp):
+    """The live g-g sample stays visible when it sits on a number."""
+    from avlite.plugins.avlite_QT5.control_plot import ControlPlot
+    from avlite.plugins.avlite_QT5.qt_binding import import_qt
+
+    _QtCore, QtGui, _QtWidgets = import_qt()
+    marker = QtGui.QColor("#3d8bfd")
+
+    def is_marker(color) -> bool:
+        return (
+            abs(color.red() - marker.red()) <= 12
+            and abs(color.green() - marker.green()) <= 12
+            and abs(color.blue() - marker.blue()) <= 12
+        )
+
+    for background in ("#2b2b2b", "#efefef"):
+        plot = ControlPlot(None)
+        plot.resize(420, 360)
+        plot.placed_size = (0, 0)
+        plot.place()
+        palette = plot.gg.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(background))
+        plot.gg.setPalette(palette)
+        # The origin sample is drawn on the center "0.0" label.
+        plot.gg.show_trail([(0.0, 0.0)], 20.0)
+        image = plot.gg.grab().toImage()
+        scale = image.devicePixelRatio() or 1.0
+        covered = 0
+        for rect in plot.gg.label_rects:
+            left = max(0, int(rect.left() * scale))
+            top = max(0, int(rect.top() * scale))
+            right = min(image.width() - 1, int(rect.right() * scale))
+            bottom = min(image.height() - 1, int(rect.bottom() * scale))
+            for y in range(top, bottom + 1):
+                for x in range(left, right + 1):
+                    if is_marker(image.pixelColor(x, y)):
+                        covered += 1
+        assert covered >= 20, background
+
+
 @pytest.mark.requires_data
 def test_pipeline_sub_strategies_follow_the_selected_strategy(window, qapp, monkeypatch):
     """Detect/Track/Predict and Behavior/Path/Speed appear only for their pipeline."""
